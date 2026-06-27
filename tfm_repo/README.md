@@ -81,6 +81,20 @@ This developer example shows how to build such a model end-to-end, distributed a
    ```
 3. Open `01_dataset_baseline_ray.ipynb` and run it top to bottom, then continue through notebooks 02–05 sequentially. 
 
+To run preprocessing without notebooks 01 and 02, use the script entry points
+from the repo root:
+
+```bash
+tfm_repo/scripts/create_temporal_splits.py \
+  tfm_repo/data/raw/parquet/card_transaction.v1.parquet \
+  --overwrite
+export TFM_SPLIT_DIR=$PWD/tfm_repo/data/temporal_split_v1
+tfm_repo/scripts/tokenize_splits.py "$TFM_SPLIT_DIR" --overwrite
+```
+
+The first script writes the full temporal splits. The second script writes the
+NB03 training inputs: `tokenized_v*/{train,val,test}`.
+
 ### Deployment
 
 #### Prerequisites

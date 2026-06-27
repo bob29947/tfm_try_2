@@ -28,6 +28,37 @@ python -c "import ray; print(ray.__version__); print(ray.__file__)"
 
 Use the `TFM Ray Dev (.venv)` Jupyter kernel when running the notebooks.
 
+## Preprocess Raw Parquet
+
+Notebook 01 and notebook 02 preprocessing can be run as two scripts. First,
+create temporal splits from a raw TabFormer parquet file:
+
+```bash
+source .venv/bin/activate
+tfm_repo/scripts/create_temporal_splits.py \
+  tfm_repo/data/raw/parquet/card_transaction.v1.parquet \
+  --overwrite
+```
+
+By default, `card_transaction.v1.parquet` writes:
+
+```text
+tfm_repo/data/temporal_split_v1/{train,val,test}
+```
+
+Then tokenize those splits for NB03:
+
+```bash
+export TFM_SPLIT_DIR=$PWD/tfm_repo/data/temporal_split_v1
+tfm_repo/scripts/tokenize_splits.py "$TFM_SPLIT_DIR" --overwrite
+export TFM_TOKENIZED_DIR=$PWD/tfm_repo/data/tokenized_v1
+```
+
+NB03 trains from `tfm_repo/data/tokenized_v1/{train,val,test}`.
+
+For v3, use `card_transaction.v3.parquet`; the default outputs become
+`temporal_split_v3` and `tokenized_v3`.
+
 ## Development Notes
 
 Push changes to this repo, not to the upstream Ray or TFM repositories. A fresh clone of `tfm_try_2` contains the Ray and notebook source files directly; `scripts/setup_venv.sh` links the installed Ray wheel's Python packages back to the local `ray/python/ray` tree.

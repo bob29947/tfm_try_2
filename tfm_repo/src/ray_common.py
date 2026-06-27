@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 # --------------------------------------------------------------------------- #
@@ -5,14 +6,20 @@ from pathlib import Path
 # running off-Anyscale so the code is still importable anywhere.
 # --------------------------------------------------------------------------- #
 _CLUSTER_STORAGE = Path("/mnt/cluster_storage")
-DATA_ROOT = (_CLUSTER_STORAGE if _CLUSTER_STORAGE.is_dir() else Path.home()) / "tfm_ray"
+_DEFAULT_DATA_ROOT = (_CLUSTER_STORAGE if _CLUSTER_STORAGE.is_dir() else Path.home()) / "tfm_ray"
+DATA_ROOT = Path(os.environ.get("TFM_DATA_ROOT", _DEFAULT_DATA_ROOT)).expanduser().resolve()
 
-RAW_DIR = DATA_ROOT / "raw"                       # synthetic / real raw parquet
-SPLIT_DIR = DATA_ROOT / "temporal_split"          # train/val/test parquet
-TOKENIZED_DIR = DATA_ROOT / "tokenized"           # NB02 output (parquet, replaces corpus.txt)
-MODEL_DIR = DATA_ROOT / "models"                   # NB03 checkpoints (HF format)
-EMBED_DIR = DATA_ROOT / "embeddings"               # NB04 output (parquet)
-OUTPUT_DIR = DATA_ROOT / "outputs"                 # NB05 plots / metrics
+
+def _dir_from_env(name: str, default: Path) -> Path:
+    return Path(os.environ.get(name, default)).expanduser().resolve()
+
+
+RAW_DIR = _dir_from_env("TFM_RAW_DIR", DATA_ROOT / "raw")                       # synthetic / real raw parquet
+SPLIT_DIR = _dir_from_env("TFM_SPLIT_DIR", DATA_ROOT / "temporal_split")        # train/val/test parquet
+TOKENIZED_DIR = _dir_from_env("TFM_TOKENIZED_DIR", DATA_ROOT / "tokenized")     # NB02 output (parquet, replaces corpus.txt)
+MODEL_DIR = _dir_from_env("TFM_MODEL_DIR", DATA_ROOT / "models")               # NB03 checkpoints (HF format)
+EMBED_DIR = _dir_from_env("TFM_EMBED_DIR", DATA_ROOT / "embeddings")           # NB04 output (parquet)
+OUTPUT_DIR = _dir_from_env("TFM_OUTPUT_DIR", DATA_ROOT / "outputs")            # NB05 plots / metrics
 
 for _d in (RAW_DIR, SPLIT_DIR, TOKENIZED_DIR, MODEL_DIR, EMBED_DIR, OUTPUT_DIR):
     _d.mkdir(parents=True, exist_ok=True)

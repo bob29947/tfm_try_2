@@ -1,0 +1,67 @@
+# Codex/app metadata
+.agents/
+.codex/
+
+# Local Python environments
+.venv/
+venv/
+.conda/
+.env
+.env.*
+!.env.example
+
+# Python and notebook cache
+__pycache__/
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local Ray runtime output
+/ray_results/
+/workflow_data/
+/logs/
+*.log
+
+# Generated data/model artifacts from the TFM notebooks
+/tfm_repo/data/
+/tfm_repo/raw/
+/tfm_repo/temporal_split*/
+/tfm_repo/tokenized/
+/tfm_repo/models/
+/tfm_repo/embeddings/
+/tfm_repo/outputs/
+/tfm_ray/
+
+# Ray build and test output
+/ray/bazel-*
+/ray/python/ray/core/
+/ray/python/ray/thirdparty_files/
+/ray/python/ray/_private/runtime_env/agent/thirdparty_files/
+/ray/python/ray/pyarrow_files/
+/ray/python/ray/jars/
+/ray/python/ray/cpp/
+/ray/python/build/
+/ray/python/dist/
+/ray/python/*.egg-info/
+/ray/.whl/
+/ray/dashboard/client/build/
+
+# ML experiment output
+/wandb/
+/mlruns/
+/lightning_logs/
+/runs/
+/checkpoints/
+
+# Editor/OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+tags

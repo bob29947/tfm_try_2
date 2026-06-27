@@ -33,9 +33,9 @@ def parse_args() -> argparse.Namespace:
         help="Tokenized output directory. Defaults to sibling tokenized_v*.",
     )
     parser.add_argument("--batch-size", type=int, default=16_384)
-    parser.add_argument("--actors", type=int, default=8)
-    parser.add_argument("--num-cpus-per-actor", type=int, default=8)
-    parser.add_argument("--num-gpus-per-actor", type=float, default=0.5)
+    parser.add_argument("--actors", type=int, default=4)
+    parser.add_argument("--num-cpus-per-actor", type=int, default=16)
+    parser.add_argument("--num-gpus-per-actor", type=float, default=1.0)
     parser.add_argument(
         "--local-num-cpus",
         type=int,
@@ -88,7 +88,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dtype",
         choices=("uint16", "int32", "int64"),
-        default="int32",
+        default="uint16",
         help="gpu-parquet engine only: dtype for fixed-width input_ids tensors.",
     )
     parser.add_argument(
@@ -345,11 +345,11 @@ def tokenize_gpu_parquet(
             runtime_env=runtime_env,
         )
 
-    data_started = time.time()
     seq_counts, pending = prepare_fast_outputs(output_dir, args)
     if not pending:
-        return seq_counts, time.time() - data_started
+        return seq_counts, 0.0
 
+    data_started = time.time()
     partitions = plan_parquet_key_range_partitions(
         {split: split_dir / split for split in pending},
         key_column="User",
@@ -400,6 +400,7 @@ def tokenize_gpu_parquet(
         runtime_env=runtime_env,
         actors=actors,
     )
+    data_elapsed_s = time.time() - data_started
 
     for actor_stats in actor_results:
         for stat in actor_stats:
@@ -426,7 +427,7 @@ def tokenize_gpu_parquet(
             f"[{split:5s}] tokenized written: "
             f"{seq_counts[split]:,} sequences at {output_dir / split}"
         )
-    return seq_counts, time.time() - data_started
+    return seq_counts, data_elapsed_s
 
 
 def main() -> None:

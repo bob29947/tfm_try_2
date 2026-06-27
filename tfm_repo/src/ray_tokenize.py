@@ -238,6 +238,9 @@ class FastParquetSplitTokenizer:
         self._prev_key = None
 
     def tokenize(self, work_items: list[dict]) -> list[dict]:
+        if len(work_items) > 1 and not self.validate_order:
+            return self._tokenize_combined_splits(work_items)
+
         stats = []
         for work in work_items:
             stats.append(self._tokenize_one_split(work))
@@ -312,10 +315,6 @@ class FastParquetSplitTokenizer:
             key_batches.clear()
             time_batches.clear()
             token_batches.clear()
-            try:
-                self.cp.get_default_memory_pool().free_all_blocks()
-            except Exception:
-                pass
 
         return {
             "split": work["split"],
@@ -329,6 +328,122 @@ class FastParquetSplitTokenizer:
             "write_s": write_s,
             "output_path": output_path,
         }
+
+    def _tokenize_combined_splits(self, work_items: list[dict]) -> list[dict]:
+        split_ids = {work["split"]: idx for idx, work in enumerate(work_items)}
+        split_names = {idx: split for split, idx in split_ids.items()}
+        output_paths = {work["split"]: work["output_path"] for work in work_items}
+        row_counts = {work["split"]: 0 for work in work_items}
+        counts = {work["split"]: 0 for work in work_items}
+        write_s = {work["split"]: 0.0 for work in work_items}
+        read_s = 0.0
+        tokenize_s = 0.0
+        sort_s = 0.0
+        sequence_s = 0.0
+        started = time.perf_counter()
+        frames = []
+
+        try:
+            for work in work_items:
+                split = work["split"]
+                split_id = split_ids[split]
+                for fragment in work["fragments"]:
+                    row_groups = list(fragment["row_groups"])
+                    for start in range(0, len(row_groups), self.row_groups_per_batch):
+                        batch_row_groups = row_groups[start:start + self.row_groups_per_batch]
+                        op_started = time.perf_counter()
+                        gdf = self._read_row_groups(fragment["path"], batch_row_groups)
+                        read_s += time.perf_counter() - op_started
+                        if len(gdf) == 0:
+                            continue
+                        gdf = self._filter_user_range(
+                            gdf, work["user_min"], work["user_max"]
+                        )
+                        if len(gdf) == 0:
+                            continue
+                        row_counts[split] += len(gdf)
+                        gdf["__split_id"] = split_id
+                        frames.append(gdf)
+
+            if frames:
+                gdf = self.cudf.concat(frames, ignore_index=True)
+                frames.clear()
+
+                op_started = time.perf_counter()
+                split_cp = gdf["__split_id"].astype("int32").to_cupy()
+                keys, txn_order, token_ids = self._tokenize_frame(gdf)
+                tokenize_s += time.perf_counter() - op_started
+                del gdf
+
+                op_started = time.perf_counter()
+                order = self.cp.lexsort(self.cp.stack([txn_order, keys, split_cp]))
+                split_cp = split_cp[order]
+                keys = keys[order]
+                token_ids = token_ids[order]
+                sort_s += time.perf_counter() - op_started
+
+                split_row_counts = self.cp.bincount(
+                    split_cp, minlength=len(work_items)
+                ).get()
+                del split_cp, txn_order, order
+                row_offset = 0
+                split_outputs = {}
+                for split_id, split in split_names.items():
+                    split_rows = int(split_row_counts[split_id])
+                    if split_rows == 0:
+                        continue
+                    row_end = row_offset + split_rows
+                    op_started = time.perf_counter()
+                    split_seqs = self._build_sequences_gpu(
+                        keys[row_offset:row_end],
+                        token_ids[row_offset:row_end],
+                    )
+                    sequence_s += time.perf_counter() - op_started
+                    row_offset = row_end
+                    if len(split_seqs) == 0:
+                        continue
+                    counts[split] += len(split_seqs)
+                    split_outputs[split] = split_seqs
+                del keys, token_ids, split_row_counts
+
+                if split_outputs:
+                    from concurrent.futures import ThreadPoolExecutor
+
+                    def write_split(split: str, split_seqs: np.ndarray):
+                        op_started = time.perf_counter()
+                        self._write_sequences(None, output_paths[split], split_seqs)
+                        return split, time.perf_counter() - op_started
+
+                    max_workers = min(len(split_outputs), 3)
+                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        futures = [
+                            executor.submit(write_split, split, split_seqs)
+                            for split, split_seqs in split_outputs.items()
+                        ]
+                        for future in futures:
+                            split, elapsed = future.result()
+                            write_s[split] += elapsed
+                    split_outputs.clear()
+        finally:
+            frames.clear()
+
+        elapsed_s = time.perf_counter() - started
+        return [
+            {
+                "split": work["split"],
+                "count": counts[work["split"]],
+                "rows": row_counts[work["split"]],
+                "elapsed_s": elapsed_s,
+                "read_s": read_s,
+                "tokenize_s": tokenize_s,
+                "sort_s": sort_s,
+                "sequence_s": sequence_s,
+                "write_s": write_s[work["split"]],
+                "combined_splits": len(work_items),
+                "output_path": output_paths[work["split"]],
+            }
+            for work in work_items
+        ]
 
     def _read_row_groups(self, path: str, row_groups: list[int]):
         cudf = self.cudf
@@ -531,14 +646,12 @@ class FastParquetSplitTokenizer:
                 [self.ArrowTensorArray.from_numpy(seqs)],
                 names=["input_ids"],
             )
-        if writer is None:
-            kwargs = {
-                "compression": self.compression,
-                "use_dictionary": self.use_dictionary,
-                "write_statistics": False,
-            }
-            if self.compression_level is not None:
-                kwargs["compression_level"] = self.compression_level
-            writer = self.pq.ParquetWriter(output_path, table.schema, **kwargs)
-        writer.write_table(table)
-        return writer
+        kwargs = {
+            "compression": self.compression,
+            "use_dictionary": self.use_dictionary,
+            "write_statistics": False,
+        }
+        if self.compression_level is not None:
+            kwargs["compression_level"] = self.compression_level
+        self.pq.write_table(table, output_path, **kwargs)
+        return None

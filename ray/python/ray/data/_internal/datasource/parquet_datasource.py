@@ -1,4 +1,5 @@
 import hashlib
+import json
 import logging
 import math
 import os
@@ -78,6 +79,9 @@ Shape = Tuple[int, ...]
 TensorColumnSchema = Dict[ColumnName, Tuple[np.dtype, Shape]]
 
 logger = logging.getLogger(__name__)
+
+_FIXED_SIZE_BINARY_TENSOR_SHAPE_KEY = b"ray.data.fixed_size_binary_tensor.shape"
+_FIXED_SIZE_BINARY_TENSOR_DTYPE_KEY = b"ray.data.fixed_size_binary_tensor.dtype"
 
 
 MIN_PYARROW_TO_BATCHES_READAHEAD = parse_version("10.0.0")
@@ -1144,6 +1148,59 @@ def _check_for_pickle_object_columns(table: "pyarrow.Table") -> None:
         )
 
 
+def _decode_fixed_size_binary_tensor_columns(table: "pyarrow.Table") -> "pyarrow.Table":
+    """Decode Ray fixed-size-binary tensor columns into ArrowTensorArray columns."""
+    import pyarrow as pa
+
+    from ray.data.extensions.tensor_extension import ArrowTensorArray
+
+    updated = table
+    for column_idx, field in enumerate(table.schema):
+        metadata = field.metadata or {}
+        if (
+            _FIXED_SIZE_BINARY_TENSOR_SHAPE_KEY not in metadata
+            or _FIXED_SIZE_BINARY_TENSOR_DTYPE_KEY not in metadata
+        ):
+            continue
+
+        shape = tuple(json.loads(metadata[_FIXED_SIZE_BINARY_TENSOR_SHAPE_KEY]))
+        dtype = np.dtype(metadata[_FIXED_SIZE_BINARY_TENSOR_DTYPE_KEY].decode())
+        expected_byte_width = int(np.prod(shape)) * dtype.itemsize
+        if not pa.types.is_fixed_size_binary(field.type):
+            raise ValueError(
+                f"Column {field.name!r} has fixed-size-binary tensor metadata "
+                f"but type {field.type}."
+            )
+        if field.type.byte_width != expected_byte_width:
+            raise ValueError(
+                f"Column {field.name!r} has byte width {field.type.byte_width}, "
+                f"expected {expected_byte_width} for tensor shape {shape} and "
+                f"dtype {dtype}."
+            )
+
+        decoded_chunks = []
+        for chunk in table.column(column_idx).chunks:
+            if chunk.null_count:
+                raise ValueError(
+                    f"Column {field.name!r} contains null tensors, which are not "
+                    "supported by fixed-size-binary tensor decoding."
+                )
+            data = chunk.buffers()[1]
+            offset = chunk.offset * expected_byte_width
+            data = data.slice(offset, len(chunk) * expected_byte_width)
+            arr = np.frombuffer(data, dtype=dtype).reshape((len(chunk),) + shape)
+            decoded_chunks.append(ArrowTensorArray.from_numpy(arr))
+
+        decoded = (
+            decoded_chunks[0]
+            if len(decoded_chunks) == 1
+            else pa.chunked_array(decoded_chunks)
+        )
+        updated = updated.set_column(column_idx, field.name, decoded)
+
+    return updated
+
+
 def read_fragments(
     block_udf: Callable[[Block], Optional[Block]],
     to_batches_kwargs: Dict[str, Any],
@@ -1188,6 +1245,7 @@ def read_fragments(
         ):
             # If the table is empty, drop it.
             if table.num_rows > 0:
+                table = _decode_fixed_size_binary_tensor_columns(table)
                 if not allow_pickle:
                     _check_for_pickle_object_columns(table)
                 if block_udf is not None:

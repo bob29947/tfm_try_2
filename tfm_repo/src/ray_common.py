@@ -57,6 +57,17 @@ GPU_RUNTIME_ENV = {
     "env_vars": {"PIP_EXTRA_INDEX_URL": "https://pypi.nvidia.com"},
 }
 
+# Tokenization only needs RAPIDS/cuDF and CuPy.  Keeping this runtime smaller
+# avoids pulling training/inference wheels into the preprocessing benchmark.
+TOKENIZE_GPU_RUNTIME_ENV = {
+    "pip": [
+        "cudf-cu12==25.6.*",
+        "cupy-cuda12x[ctk]",
+        "pyarrow",
+    ],
+    "env_vars": {"PIP_EXTRA_INDEX_URL": "https://pypi.nvidia.com"},
+}
+
 # Ray Train workers inherit the JOB runtime_env, so for training notebooks we
 # pass this combined env to `ray.init` (code + pip). The CPU head driver does not
 # import torch, so its (cached) install is harmless.

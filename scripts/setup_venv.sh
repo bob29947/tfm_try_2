@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 VENV_DIR="${VENV_DIR:-$ROOT_DIR/.venv}"
 RAY_VERSION="${RAY_VERSION:-3.0.0.dev0}"
+RAY_WHEEL_COMMIT="${RAY_WHEEL_COMMIT:-85bdbaa879fc6a78c5d80256bb677fe2fb297430}"
 
 "$PYTHON_BIN" -m venv "$VENV_DIR"
 
@@ -23,10 +24,20 @@ case "$ARCH" in
     ;;
 esac
 
-RAY_WHEEL_URL="${RAY_WHEEL_URL:-https://s3-us-west-2.amazonaws.com/ray-wheels/latest/ray-${RAY_VERSION}-${PY_TAG}-${PY_TAG}-${PLATFORM_TAG}.whl}"
+RAY_WHEEL_NAME="ray-${RAY_VERSION}-${PY_TAG}-${PY_TAG}-${PLATFORM_TAG}.whl"
+DEFAULT_RAY_WHEEL_URL="https://s3-us-west-2.amazonaws.com/ray-wheels/master/${RAY_WHEEL_COMMIT}/${RAY_WHEEL_NAME}"
+LATEST_RAY_WHEEL_URL="https://s3-us-west-2.amazonaws.com/ray-wheels/latest/${RAY_WHEEL_NAME}"
+RAY_WHEEL_URL="${RAY_WHEEL_URL:-$DEFAULT_RAY_WHEEL_URL}"
 
 "$VENV_DIR/bin/python" -m pip install --upgrade pip wheel
-"$VENV_DIR/bin/python" -m pip install "ray[data,train] @ ${RAY_WHEEL_URL}"
+if ! "$VENV_DIR/bin/python" -m pip install "ray[data,train] @ ${RAY_WHEEL_URL}"; then
+  if [[ "$RAY_WHEEL_URL" == "$DEFAULT_RAY_WHEEL_URL" ]]; then
+    echo "Commit-specific Ray wheel was unavailable; falling back to latest nightly." >&2
+    "$VENV_DIR/bin/python" -m pip install "ray[data,train] @ ${LATEST_RAY_WHEEL_URL}"
+  else
+    exit 1
+  fi
+fi
 "$VENV_DIR/bin/python" -m pip install -r "$ROOT_DIR/tfm_repo/requirements.txt"
 
 (

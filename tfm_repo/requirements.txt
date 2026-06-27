@@ -1,0 +1,8 @@
+# Ray is installed by ../scripts/setup_venv.sh from a dev wheel and then
+# linked to ../ray/python/ray with Ray's setup-dev.py.
+scikit-learn==1.5.2
+matplotlib
+plotly
+nbconvert
+ipywidgets
+ipykernel

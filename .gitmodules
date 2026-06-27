@@ -1,6 +1,0 @@
-[submodule "ray"]
-	path = ray
-	url = https://github.com/ray-project/ray.git
-[submodule "tfm_repo"]
-	path = tfm_repo
-	url = https://github.com/anyscale/transaction-foundation-model-with-ray.git

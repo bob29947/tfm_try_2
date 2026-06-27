@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Generated notebook data and artifacts
+data/
+raw/
+temporal_split*/
+tokenized/
+models/
+embeddings/
+outputs/
+tfm_ray/
+
+# Local runtime/cache output
+ray_results/
+workflow_data/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.log

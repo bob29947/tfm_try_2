@@ -12,15 +12,24 @@ The final normal-RAID run used Ray with four one-GPU actors, 16 CPUs per actor,
 fixed-size-binary `uint16` tensors, no compression, and no dictionary encoding.
 
 - Original normal-RAID time: **7.07 s**
-- Final normal-RAID time: **4.54 s**
-- Improvement: **1.56x** (**35.8% less time**)
+- Previous optimized normal-RAID time: **4.54 s**
+- Final normal-RAID time: **3.03 s median** (**2.98–3.08 s**)
+- Improvement from the original: **2.33x** (**57.1% less time**)
 - Output counts: train 614,874; validation 81,993; test 82,794
 
-The 4.54 s figure is the same prewarmed, page-cached, buffered data-path
-stopwatch used for the 7.07 s baseline. It excludes Ray/actor startup, output
-cleanup, post-run provenance hashing, and durable `fsync`. The final audited
-run separately measured 22.60 s for SHA-256 provenance work and 35.66 s for
-the process including Ray startup.
+The final actor initializes an 8 GiB RMM device-memory pool before importing
+cuDF and routes CuPy allocations through it. This replaces repeated serialized
+CUDA allocation/free calls with standard allocator reuse; every read,
+tokenization, sort, sequence construction, host transfer, and normal-RAID
+write remains in the timed path.
+
+The 3.03 s median is from two final-code runs using the same prewarmed,
+page-cached, buffered data-path stopwatch used for the 7.07 s baseline. It
+excludes Ray/actor startup, output cleanup, post-run provenance hashing, and
+durable `fsync`. The final audited run measured 2.98 s for that data path,
+22.98 s for SHA-256 provenance work, and 34.56 s for the process including Ray
+startup. A same-day run immediately before the allocator change measured
+4.68 s with otherwise identical arguments.
 
 Logical tensor bytes match the previously verified fast v3 corpus for every
 sequence:
@@ -32,7 +41,9 @@ sequence:
 | test | 82,794 | `3f08c2562dbd7e1a3e20d6df77999b455cdc2fdce8e915eca06985c88e8841a1` |
 
 The run manifest is
-`data/tokenized_v3_gpu_parquet_final_verify/_tokenization_manifest.json`.
+`data/tokenized_v3_sub4_bench/_tokenization_manifest.json`. Its source-file
+records and every output file's path, row count, byte count, and SHA-256 match
+the previous verified manifest exactly.
 
 ## Merchant mapping
 
@@ -102,9 +113,10 @@ weighting, V100 precision, and fixed estimator budget differ.
 
 ## Remaining performance headroom
 
-The slowest actor in the final run spent about 1.16 s reading, 1.38 s
-tokenizing, 0.21 s sorting, 0.85 s constructing sequences, and 0.67 s writing.
-Low-risk tuning on the same four GPUs likely leaves less than another 10%.
-More invasive overlap/fusion work plausibly reaches roughly 3.6–4.1 s; getting
-below 3.5 s would require removing more than 23% of the current critical path
-or changing the resource comparison.
+The slowest actor in the final run took 2.95 s and reported about 0.51 s
+reading, 0.72 s tokenizing, 0.14 s sorting, 0.83 s constructing sequences, and
+0.72 s writing; CPU writes overlap other work, so stage values are not
+additive. Profiling shows the next largest exact-semantics opportunity is the
+pageable GPU-to-host sequence copy. Pinned staging plus split/write overlap
+could plausibly remove another 0.3–0.6 s, but it adds memory-lifetime and
+resource-management complexity that is not needed for the sub-4-second goal.

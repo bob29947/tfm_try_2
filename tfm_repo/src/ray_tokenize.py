@@ -156,10 +156,31 @@ class FastParquetSplitTokenizer:
         output_shard_size_bytes: int = 256 * 1024 * 1024,
         validate_order: bool = False,
     ):
+        # The fast path creates and releases several multi-GiB temporary arrays.
+        # cudaMalloc/cudaFree serialization is otherwise a material part of the
+        # data stopwatch, so give each long-lived, one-GPU actor its own RMM
+        # pool before importing cuDF or CuPy.  Start at 8 GiB (large enough to
+        # recycle the hot temporaries without reserving most of a 32 GiB GPU),
+        # keep 2 GiB outside the pool for CUDA libraries, and adapt down on
+        # smaller or partially occupied GPUs.
+        import rmm
+
+        gib = 1 << 30
+        free_bytes, _ = rmm.mr.available_device_memory()
+        maximum_pool_size = min(30 * gib, max(0, free_bytes - 2 * gib))
+        initial_pool_size = min(8 * gib, maximum_pool_size)
+        if initial_pool_size >= gib:
+            rmm.reinitialize(
+                pool_allocator=True,
+                initial_pool_size=initial_pool_size,
+                maximum_pool_size=maximum_pool_size,
+            )
+
         import cudf  # lazy: worker-only
         import cupy as cp
         import pyarrow as pa
         import pyarrow.parquet as pq
+        from rmm.allocators.cupy import rmm_cupy_allocator
         from ray.data.extensions.tensor_extension import ArrowTensorArray
         from src.tokenizer.financial_pipeline import (
             ALL_STATES,
@@ -167,6 +188,8 @@ class FastParquetSplitTokenizer:
             INDUSTRY_RANGES,
             KNOWN_MCCS,
         )
+
+        cp.cuda.set_allocator(rmm_cupy_allocator)
 
         if arrow_cpu_threads:
             pa.set_cpu_count(int(arrow_cpu_threads))

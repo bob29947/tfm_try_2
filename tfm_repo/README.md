@@ -95,6 +95,13 @@ tfm_repo/scripts/tokenize_splits.py "$TFM_SPLIT_DIR" --overwrite
 The first script writes the full temporal splits. The second script writes the
 NB03 training inputs: `tokenized_v*/{train,val,test}`.
 
+`tokenize_splits.py` defaults to the application-local `gpu-parquet` engine.
+It uses Ray Core actors that read shared-POSIX Parquet row groups directly,
+filter their assigned integral `User` range, and write idempotent output shards.
+This avoids the materialization and groupby shuffle in the `legacy` Ray Data
+path while keeping the dataset-specific I/O and commit contract in this
+application. Pass `--engine legacy` to use the standard Ray Data pipeline.
+
 ### Deployment
 
 #### Prerequisites

@@ -79,7 +79,7 @@ def parse_args() -> argparse.Namespace:
         choices=("gpu-parquet", "legacy"),
         default="gpu-parquet",
         help=(
-            "Use Ray's experimental GPU parquet key-range partition runner or "
+            "Use the application-local Ray Core GPU parquet runner or "
             "the legacy Ray Data groupby path."
         ),
     )
@@ -306,6 +306,7 @@ def source_file_manifest(source_root: Path) -> dict[str, list[dict]]:
 def code_manifest() -> dict[str, str]:
     code_files = [
         Path(__file__).resolve(),
+        TFM_ROOT / "src" / "gpu_parquet.py",
         TFM_ROOT / "src" / "ray_common.py",
         TFM_ROOT / "src" / "ray_tokenize.py",
         *sorted((TFM_ROOT / "src" / "tokenizer").glob("*.py")),
@@ -313,14 +314,6 @@ def code_manifest() -> dict[str, str]:
     manifest = {
         str(path.relative_to(TFM_ROOT)): file_sha256(path) for path in code_files
     }
-    try:
-        import inspect
-        from ray.data.experimental import gpu_parquet
-
-        external = Path(inspect.getsourcefile(gpu_parquet)).resolve()
-        manifest["external:ray.data.experimental.gpu_parquet"] = file_sha256(external)
-    except (ImportError, OSError, TypeError):
-        manifest["external:ray.data.experimental.gpu_parquet"] = "unavailable"
     return manifest
 
 
@@ -596,7 +589,7 @@ def tokenize_gpu_parquet(
     output_dir: Path,
     args: argparse.Namespace,
 ) -> tuple[dict[str, int], float]:
-    from ray.data.experimental.gpu_parquet import (
+    from src.gpu_parquet import (
         create_gpu_parquet_actors,
         map_gpu_parquet_partitions,
         plan_parquet_key_range_partitions,
@@ -678,7 +671,7 @@ def tokenize_gpu_parquet(
         f"compression {args.compression}, "
         f"dictionary {'on' if args.use_dictionary else 'off'}, "
         f"deps from {runtime_env_label} "
-        "(ray.data.experimental.gpu_parquet)"
+        "(application-local Ray Core runner)"
     )
 
     actor_results = map_gpu_parquet_partitions(

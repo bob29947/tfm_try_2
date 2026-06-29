@@ -23,6 +23,12 @@ CUDA allocation/free calls with standard allocator reuse; every read,
 tokenization, sort, sequence construction, host transfer, and normal-RAID
 write remains in the timed path.
 
+The key-range planner and long-lived actor runner are application code in
+`src/gpu_parquet.py`. Ray supplies scheduling and GPU isolation, while the TFM
+pipeline owns its shared-filesystem, integral-key filtering, output commit, and
+RMM policies. Fixed-size-binary outputs are read through Ray's existing
+`tensor_column_schema` option rather than a custom Parquet datasource hook.
+
 The 3.03 s median is from two final-code runs using the same prewarmed,
 page-cached, buffered data-path stopwatch used for the 7.07 s baseline. It
 excludes Ray/actor startup, output cleanup, post-run provenance hashing, and
@@ -30,6 +36,12 @@ durable `fsync`. The final audited run measured 2.98 s for that data path,
 22.98 s for SHA-256 provenance work, and 34.56 s for the process including Ray
 startup. A same-day run immediately before the allocator change measured
 4.68 s with otherwise identical arguments.
+
+After moving the runner out of Ray and switching consumers to Ray's public
+tensor schema option, a fresh normal-RAID audit measured **3.02 s** for the
+same data path, 22.71 s for provenance, and 33.92 s end to end. The source
+manifest, sequence counts, and all 56 output files (paths, rows, bytes, and
+SHA-256) remained identical.
 
 Logical tensor bytes match the previously verified fast v3 corpus for every
 sequence:

@@ -61,6 +61,17 @@ For v3, use `card_transaction.v3.parquet`; the default outputs become
 
 ## Development Notes
 
-Push changes to this repo, not to the upstream Ray or TFM repositories. A fresh clone of `tfm_try_2` contains the Ray and notebook source files directly; `scripts/setup_venv.sh` links the installed Ray wheel's Python packages back to the local `ray/python/ray` tree.
+Keep TFM application changes in this repository. A fresh clone of `tfm_try_2`
+contains the Ray and notebook source files directly; `scripts/setup_venv.sh`
+links the installed Ray wheel's Python packages back to the local
+`ray/python/ray` tree. Prepare generic Ray contributions from a separate
+worktree based directly on `ray-project/ray` master, then push them through a
+personal Ray fork for upstream review.
+
+The optimized TFM Parquet runner is application code in
+`tfm_repo/src/gpu_parquet.py`; the main workspace no longer overlays that
+runner or its tensor decoding onto Ray. Prepare generic upstream Ray changes in
+a separate Ray worktree so application benchmarks and upstream PR scope remain
+independent.
 
 If you edit Ray Python code under `ray/python/ray`, rerun the notebooks with the `TFM Ray Dev (.venv)` kernel and the changes should be picked up immediately. If you edit Ray's compiled C++ core, rebuild/install a matching Ray wheel before expecting notebook runs to use those compiled changes.

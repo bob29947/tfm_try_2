@@ -1,4 +1,4 @@
-"""GPU-oriented parquet fragment execution helpers.
+"""Application-local Ray Core runner for GPU-oriented Parquet fragments.
 
 This module is intentionally small and experimental.  It covers a common GPU
 ETL shape that is awkward to express efficiently with block-oriented APIs:
@@ -8,8 +8,12 @@ ETL shape that is awkward to express efficiently with block-oriented APIs:
 * Each partition should run inside a long-lived GPU actor that reads parquet
   fragments, processes them, and writes its own output shard.
 
-The helpers below are generic.  Ray handles key-range planning and GPU actor
-scheduling; user code provides the domain-specific processor class.
+This deliberately lives with the TFM pipeline rather than in Ray Data. Paths
+must be shared POSIX paths visible to every worker, and the partition key must
+have integral Parquet min/max statistics. Ranges have equal key width rather
+than balanced row counts. A row group can overlap multiple ranges, so every
+processor MUST filter its rows to the inclusive ``key_min``/``key_max`` bounds.
+The caller owns idempotent output naming, incomplete-output cleanup, and commit.
 """
 
 from __future__ import annotations
@@ -51,6 +55,11 @@ def _normalize_inputs(inputs: NamedInputs) -> Dict[str, List[Path]]:
 
 def _key_ranges(key_min: int, key_max: int, num_partitions: int) -> List[Tuple[int, int]]:
     total = key_max - key_min + 1
+    if num_partitions > total:
+        raise ValueError(
+            f"num_partitions ({num_partitions}) exceeds the integral key "
+            f"cardinality ({total})"
+        )
     return [
         (
             key_min + (idx * total) // num_partitions,

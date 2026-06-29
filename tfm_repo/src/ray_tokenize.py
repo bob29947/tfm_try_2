@@ -24,7 +24,12 @@ class GPUTokenizer:
     Returned arrays are plain numpy so the CPU head can handle them.
     """
 
-    def __init__(self, merchant_hash_size: int = C.MERCHANT_HASH_SIZE, carry_cols=None):
+    def __init__(
+        self,
+        merchant_hash_size: int = C.MERCHANT_HASH_SIZE,
+        carry_cols=None,
+        merchant_hash_mode: str = C.MERCHANT_HASH_MODE,
+    ):
         import cudf  # lazy: worker-only
         from src.tokenizer import FinancialTokenizerPipeline
 
@@ -32,6 +37,7 @@ class GPUTokenizer:
         self.pipeline = FinancialTokenizerPipeline(
             merchant_hash_size=merchant_hash_size, use_streams=False,
         )
+        self.merchant_hash_mode = merchant_hash_mode
         self._fitted = False
         # Optional raw columns to pass through, aligned with each tokenized row
         # (used by NB04 so the embeddings table also holds raw features for the
@@ -53,7 +59,10 @@ class GPUTokenizer:
         # the whole tokenizer runs on the worker GPU with zero host round-trips.
         # Fall back to constructing one if called with a pandas/dict batch.
         gdf = batch if isinstance(batch, cudf.DataFrame) else cudf.DataFrame(batch)
-        proc = self.pipeline.preprocess(gdf)          # also sorts by user/card/time
+        proc = self.pipeline.preprocess(
+            gdf,
+            merchant_hash_mode=self.merchant_hash_mode,
+        )                                             # also sorts by user/card/time
         if not self._fitted:
             # vocab is data-independent (fixed bins/hash/ranges) -> consistent IDs.
             self.pipeline.fit(proc)

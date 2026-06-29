@@ -79,6 +79,7 @@ TRAIN_JOB_ENV = {
 
 # Model / tokenizer constants shared across notebooks (match the original blueprint).
 MERCHANT_HASH_SIZE = 2000
+MERCHANT_HASH_MODE = "integer_mod"
 # Match the original blueprint exactly: 315 transactions packed into a
 # 4096-token causal-LM sequence (~13 tok/txn incl. separators). Same ~64K train
 # sequences and same model context window as the original NB02/03.
@@ -108,4 +109,6 @@ MODEL_CONFIG = dict(
     bos_token_id=BOS_TOKEN_ID,
     eos_token_id=EOS_TOKEN_ID,
     pad_token_id=PAD_TOKEN_ID,
+    merchant_hash_mode=MERCHANT_HASH_MODE,
+    merchant_hash_size=MERCHANT_HASH_SIZE,
 )

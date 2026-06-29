@@ -206,7 +206,10 @@ class FinancialTokenizerPipeline(TokenizerPipeline):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def preprocess(df: cudf.DataFrame) -> cudf.DataFrame:
+    def preprocess(
+        df: cudf.DataFrame,
+        merchant_hash_mode: str = "integer_mod",
+    ) -> cudf.DataFrame:
         """Normalize columns and derive intermediate fields expected by the
         pipeline steps.  Operates in-place on a cuDF DataFrame.
 
@@ -231,13 +234,29 @@ class FinancialTokenizerPipeline(TokenizerPipeline):
             + (amt_f >= 5000).astype("int32")
         )
 
-        merch_clean = (
-            df["merchant_name"]
-            .astype(str)
-            .str.upper()
-            .str.replace(r"[^A-Z0-9\s\-]", "", regex=True)
-        )
-        df["merch_hash"] = merch_clean.hash_values()
+        if merchant_hash_mode == "integer_mod":
+            # TabFormer stores Merchant Name as an opaque signed int64 ID.  The
+            # fast parquet training path buckets that ID directly; using the
+            # same mapping here keeps NB04 inference aligned with pretraining
+            # and avoids a redundant integer -> string -> hash round trip.
+            merchant = df["merchant_name"].fillna(0).astype("int64")
+            # CategoricalHashTokenizer applies its configured modulo. Keeping
+            # the preprocessed value unbucketed avoids a second, independently
+            # configured hash-size default.
+            df["merch_hash"] = merchant.abs()
+        elif merchant_hash_mode == "string_hash":
+            merch_clean = (
+                df["merchant_name"]
+                .astype(str)
+                .str.upper()
+                .str.replace(r"[^A-Z0-9\s\-]", "", regex=True)
+            )
+            df["merch_hash"] = merch_clean.hash_values()
+        else:
+            raise ValueError(
+                "merchant_hash_mode must be 'integer_mod' or 'string_hash', "
+                f"got {merchant_hash_mode!r}"
+            )
 
         mcc = df["mcc"].fillna(-1).astype(int)
         df["mcc_int"] = mcc

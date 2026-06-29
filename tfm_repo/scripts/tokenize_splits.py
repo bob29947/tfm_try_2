@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -19,6 +20,7 @@ TFM_ROOT = Path(__file__).resolve().parents[1]
 SPLITS = ("train", "val", "test")
 FAST_OUTPUT_IN_PROGRESS = "_IN_PROGRESS"
 FAST_OUTPUT_SUCCESS = "_SUCCESS"
+TOKENIZATION_MANIFEST = "_tokenization_manifest.json"
 
 
 def parse_args() -> argparse.Namespace:
@@ -79,6 +81,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Use Ray's experimental GPU parquet key-range partition runner or "
             "the legacy Ray Data groupby path."
+        ),
+    )
+    parser.add_argument(
+        "--merchant-hash-mode",
+        choices=("integer_mod", "string_hash"),
+        default="integer_mod",
+        help=(
+            "Merchant bucket mapping for the legacy Ray Data engine. The fast "
+            "gpu-parquet engine always uses integer_mod."
         ),
     )
     parser.add_argument(
@@ -193,6 +204,11 @@ def validate_args(args: argparse.Namespace) -> tuple[Path, Path]:
     if args.row_groups_per_batch < 1:
         raise ValueError("--row-groups-per-batch must be at least 1")
     if args.engine == "gpu-parquet":
+        if args.merchant_hash_mode != "integer_mod":
+            raise ValueError(
+                "The gpu-parquet engine implements integer_mod merchant mapping; "
+                "use --engine legacy for string_hash."
+            )
         if args.write_threads_per_actor < 1:
             raise ValueError("--write-threads-per-actor must be at least 1")
         if args.write_threads_per_actor > args.num_cpus_per_actor:
@@ -206,7 +222,226 @@ def validate_args(args: argparse.Namespace) -> tuple[Path, Path]:
         if args.output_dir
         else default_output_dir(split_dir)
     )
+    if (
+        output_dir == split_dir
+        or output_dir in split_dir.parents
+        or split_dir in output_dir.parents
+    ):
+        raise ValueError(
+            f"Input and output directories must not overlap: {split_dir}, {output_dir}"
+        )
+    auxiliary_paths = []
+    if args.ray_temp_dir is not None:
+        auxiliary_paths.append(("Ray temp", args.ray_temp_dir.expanduser().resolve()))
+    if args.ray_spill_dir is not None:
+        auxiliary_paths.append(("Ray spill", args.ray_spill_dir.expanduser().resolve()))
+    for label, auxiliary in auxiliary_paths:
+        for protected in (split_dir, output_dir):
+            if (
+                auxiliary == protected
+                or auxiliary in protected.parents
+                or protected in auxiliary.parents
+            ):
+                raise ValueError(
+                    f"{label} path overlaps input/output: {auxiliary}, {protected}"
+                )
     return split_dir, output_dir
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(8 * 1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def tokenization_config(C, split_dir: Path, args: argparse.Namespace) -> dict:
+    config = {
+        "schema_version": 1,
+        "source": str(split_dir),
+        "engine": args.engine,
+        "merchant_hash_mode": args.merchant_hash_mode,
+        "merchant_hash_size": C.MERCHANT_HASH_SIZE,
+        "sequence_length": C.SEQ_LENGTH,
+        "sequence_chunk_size": C.SEQ_CHUNK_SIZE,
+        "actors": args.actors,
+        "cpus_per_actor": args.num_cpus_per_actor,
+        "gpus_per_actor": args.num_gpus_per_actor,
+        "actors_prewarmed": (
+            args.engine == "gpu-parquet" and not args.no_prewarm_actors
+        ),
+    }
+    if args.engine == "gpu-parquet":
+        config["output"] = {
+            "format": args.output_format,
+            "dtype": args.output_dtype,
+            "compression": args.compression,
+            "compression_level": args.compression_level,
+            "dictionary": args.use_dictionary,
+            "shard_size_mib": args.output_shard_size_mb,
+            "writer_threads_per_actor": args.write_threads_per_actor,
+        }
+        config["row_groups_per_batch"] = args.row_groups_per_batch
+        config["validate_order"] = args.validate_order
+    else:
+        config["batch_size"] = args.batch_size
+    return config
+
+
+def source_file_manifest(source_root: Path) -> dict[str, list[dict]]:
+    return {
+        split: [
+            {
+                "path": str(file.relative_to(source_root)),
+                "bytes": file.stat().st_size,
+                "sha256": file_sha256(file),
+            }
+            for file in parquet_files(source_root / split)
+        ]
+        for split in SPLITS
+    }
+
+
+def code_manifest() -> dict[str, str]:
+    code_files = [
+        Path(__file__).resolve(),
+        TFM_ROOT / "src" / "ray_common.py",
+        TFM_ROOT / "src" / "ray_tokenize.py",
+        *sorted((TFM_ROOT / "src" / "tokenizer").glob("*.py")),
+    ]
+    manifest = {
+        str(path.relative_to(TFM_ROOT)): file_sha256(path) for path in code_files
+    }
+    try:
+        import inspect
+        from ray.data.experimental import gpu_parquet
+
+        external = Path(inspect.getsourcefile(gpu_parquet)).resolve()
+        manifest["external:ray.data.experimental.gpu_parquet"] = file_sha256(external)
+    except (ImportError, OSError, TypeError):
+        manifest["external:ray.data.experimental.gpu_parquet"] = "unavailable"
+    return manifest
+
+
+def runtime_manifest() -> dict[str, str]:
+    import numpy
+    import pyarrow
+    import ray
+
+    versions = {
+        "numpy": numpy.__version__,
+        "pyarrow": pyarrow.__version__,
+        "ray": ray.__version__,
+        "python": sys.version.split()[0],
+    }
+    try:
+        import cudf
+
+        versions["cudf"] = cudf.__version__
+    except ImportError:
+        versions["cudf"] = "unavailable"
+    try:
+        import cupy
+
+        versions["cupy"] = cupy.__version__
+        name = cupy.cuda.runtime.getDeviceProperties(0)["name"]
+        versions["gpu"] = name.decode() if isinstance(name, bytes) else str(name)
+    except Exception:
+        versions["cupy"] = versions.get("cupy", "unavailable")
+        versions["gpu"] = "unavailable"
+    return versions
+
+
+def output_file_manifest(output_dir: Path) -> dict[str, list[dict]]:
+    import pyarrow.parquet as pq
+
+    return {
+        split: [
+            {
+                "path": str(file.relative_to(output_dir)),
+                "bytes": file.stat().st_size,
+                "rows": pq.ParquetFile(file).metadata.num_rows,
+                "sha256": file_sha256(file),
+            }
+            for file in parquet_files(output_dir / split)
+        ]
+        for split in SPLITS
+    }
+
+
+def validate_existing_manifest(
+    output_dir: Path,
+    expected_config: dict,
+    overwrite: bool,
+) -> None:
+    if overwrite or not nonempty_dir(output_dir):
+        return
+    manifest_path = output_dir / TOKENIZATION_MANIFEST
+    if not manifest_path.exists():
+        raise RuntimeError(
+            f"Existing output has no tokenization manifest: {output_dir}. "
+            "Pass --overwrite to regenerate it safely."
+        )
+    manifest = json.loads(manifest_path.read_text())
+    if manifest.get("config") != expected_config:
+        raise RuntimeError(
+            "Existing tokenization settings do not match this command. "
+            f"Recorded={manifest.get('config')!r}, requested={expected_config!r}. "
+            "Use a new --output-dir or pass --overwrite."
+        )
+    current_sources = source_file_manifest(Path(expected_config["source"]))
+    if manifest.get("source_files") != current_sources:
+        raise RuntimeError(
+            "Source parquet files changed since this tokenized output was written. "
+            "Use a new --output-dir or pass --overwrite."
+        )
+    if manifest.get("code_sha256") != code_manifest():
+        raise RuntimeError(
+            "Tokenizer implementation changed since this output was written. "
+            "Use a new --output-dir or pass --overwrite."
+        )
+    if manifest.get("runtime") != runtime_manifest():
+        raise RuntimeError(
+            "Runtime package/GPU versions changed since this output was written. "
+            "Use a new --output-dir or pass --overwrite."
+        )
+    current_outputs = output_file_manifest(output_dir)
+    if manifest.get("output_files") != current_outputs:
+        raise RuntimeError(
+            "Tokenized parquet files changed since the manifest was written. "
+            "Use a new --output-dir or pass --overwrite."
+        )
+    current_counts = {
+        split: sum(item["rows"] for item in files)
+        for split, files in current_outputs.items()
+    }
+    if manifest.get("sequence_counts") != current_counts:
+        raise RuntimeError(
+            f"Tokenized row counts changed: recorded={manifest.get('sequence_counts')}, "
+            f"current={current_counts}."
+        )
+
+
+def write_tokenization_manifest(
+    output_dir: Path,
+    config: dict,
+    seq_counts: dict[str, int],
+    elapsed_s: float,
+) -> None:
+    source_root = Path(config["source"])
+    manifest = {
+        "config": config,
+        "sequence_counts": seq_counts,
+        "source_files": source_file_manifest(source_root),
+        "elapsed_seconds": elapsed_s,
+        "output_files": output_file_manifest(output_dir),
+        "code_sha256": code_manifest(),
+        "runtime": runtime_manifest(),
+    }
+    (output_dir / TOKENIZATION_MANIFEST).write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+    )
 
 
 def init_ray(C, args: argparse.Namespace):
@@ -265,12 +500,15 @@ def tokenize_split(
     ds = ray.data.read_parquet(str(split_dir / split))
     toks = ds.map_batches(
         GPUTokenizer,
-        fn_constructor_kwargs={"merchant_hash_size": C.MERCHANT_HASH_SIZE},
+        fn_constructor_kwargs={
+            "merchant_hash_size": C.MERCHANT_HASH_SIZE,
+            "merchant_hash_mode": args.merchant_hash_mode,
+        },
         batch_size=args.batch_size,
         compute=ray.data.ActorPoolStrategy(size=args.actors),
         num_gpus=args.num_gpus_per_actor,
         batch_format="cudf",
-        runtime_env=C.GPU_RUNTIME_ENV,
+        runtime_env=(None if args.gpu_runtime_env == "none" else C.GPU_RUNTIME_ENV),
     )
     seqs = toks.groupby("uc_key").map_groups(build_sequences, batch_format="numpy")
     seqs.write_parquet(str(out))
@@ -490,6 +728,7 @@ def tokenize_gpu_parquet(
 
 
 def main() -> None:
+    process_started = time.time()
     args = parse_args()
     split_dir, output_dir = validate_args(args)
 
@@ -501,6 +740,11 @@ def main() -> None:
 
     from src import ray_common as C
 
+    manifest_config = tokenization_config(C, split_dir, args)
+    validate_existing_manifest(output_dir, manifest_config, args.overwrite)
+    all_outputs_existed = all(
+        nonempty_dir(output_dir / split) for split in SPLITS
+    )
     ray = init_ray(C, args)
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"Split input:    {split_dir}")
@@ -518,11 +762,27 @@ def main() -> None:
             seq_counts[split] = tokenize_split(ray, C, split_dir, output_dir, split, args)
         elapsed_s = time.time() - started
 
+    manifest_path = output_dir / TOKENIZATION_MANIFEST
+    manifest_elapsed_s = 0.0
+    if args.overwrite or not all_outputs_existed or not manifest_path.exists():
+        manifest_started = time.time()
+        write_tokenization_manifest(output_dir, manifest_config, seq_counts, elapsed_s)
+        manifest_elapsed_s = time.time() - manifest_started
+
     print("\nTokenized outputs for NB03:")
     for split in SPLITS:
         print(f"  {split:5s}: {seq_counts[split]:>10,} sequences -> {output_dir / split}")
     print(f"\nPoint NB03 at this output with:\n  export TFM_TOKENIZED_DIR={output_dir}")
-    print(f"Tokenization wall time: {elapsed_s:.2f} s")
+    if args.engine == "legacy":
+        timing_label = "Legacy tokenization data-path time"
+    elif args.no_prewarm_actors:
+        timing_label = "Tokenization data-path time including actor startup"
+    else:
+        timing_label = "Prewarmed tokenization data-path time"
+    print(f"{timing_label}: {elapsed_s:.2f} s")
+    if manifest_elapsed_s:
+        print(f"Post-timer provenance manifest time: {manifest_elapsed_s:.2f} s")
+    print(f"End-to-end process time (including Ray startup): {time.time()-process_started:.2f} s")
 
 
 if __name__ == "__main__":

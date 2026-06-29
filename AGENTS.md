@@ -15,5 +15,7 @@
   per actor, 128 MiB output shards, fixed-size binary tensor output, `uint16`
   token IDs, no parquet compression, and no dictionary encoding. With actor
   and CUDA-kernel prewarm plus output cleanup excluded from the data stopwatch,
-  the best measured v3 wall time was 4.56s for train/val/test on normal RAID
-  output; repeated runs with the same defaults measured 4.56-5.00s.
+  the best measured v3 data-path time was 4.54s for train/val/test on normal
+  RAID output; repeated runs with the same defaults measured 4.54-5.00s. This
+  stopwatch is prewarmed and excludes Ray startup, output cleanup, provenance
+  hashing, and durable fsync.

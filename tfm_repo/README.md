@@ -101,6 +101,37 @@ filter their assigned integral `User` range, and write idempotent output shards.
 This avoids the materialization and groupby shuffle in the `legacy` Ray Data
 path while keeping the dataset-specific I/O and commit contract in this
 application. Pass `--engine legacy` to use the standard Ray Data pipeline.
+The normal command defaults to two one-GPU actors, matching the deployment
+below. Fixed local Ray runtimes fail early if they cannot schedule all requested
+long-lived actors; remote clusters can still autoscale from submitted demand.
+
+The audited local four-V100 settings are an explicit benchmark profile:
+
+```bash
+tfm_repo/scripts/tokenize_splits.py \
+  tfm_repo/data/temporal_split_v3 \
+  --profile v3-4x-v100 \
+  --ray-address local \
+  --overwrite
+```
+
+See `benchmarks/tokenization/README.md` for its scope. Validation tooling is
+separate from the normal pipeline and can be listed with
+`cd tfm_repo && python -m validation.tokenization --help`.
+
+#### Tokenization code layout
+
+| Location | Role | Required for a normal run |
+|----------|------|---------------------------|
+| `src/tokenization/` | Runtime, artifact contract, tensor I/O, and provenance | Yes |
+| `src/tokenization/parquet_runner.py` | Application-local Parquet planning and Ray actor dispatch | Fast engine only |
+| `scripts/tokenize_splits.py` | Stable, thin command-line entry point | Yes |
+| `validation/tokenization/` | Paired LM/fraud quality experiments behind one CLI | No |
+| `benchmarks/tokenization/` | Machine-specific profiles and timing notes | No |
+
+`src/ray_tokenize.py` and `src/gpu_parquet.py` are compatibility facades; new
+code should import the focused packages above. Validation has one public script,
+`scripts/validate_tokenization.py`, with subcommands for each experiment stage.
 
 ### Deployment
 

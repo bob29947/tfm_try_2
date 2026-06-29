@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Compatibility entry point for the tokenization CLI."""
+"""Command-line entry point for paired tokenization validation."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ TFM_ROOT = Path(__file__).resolve().parents[1]
 def main() -> None:
     if str(TFM_ROOT) not in sys.path:
         sys.path.insert(0, str(TFM_ROOT))
-    from src.tokenization.cli import main as package_main
+    from validation.tokenization import main as package_main
 
     package_main()
 

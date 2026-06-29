@@ -69,9 +69,17 @@ worktree based directly on `ray-project/ray` master, then push them through a
 personal Ray fork for upstream review.
 
 The optimized TFM Parquet runner is application code in
-`tfm_repo/src/gpu_parquet.py`; the main workspace no longer overlays that
-runner or its tensor decoding onto Ray. Prepare generic upstream Ray changes in
-a separate Ray worktree so application benchmarks and upstream PR scope remain
-independent.
+`tfm_repo/src/tokenization/parquet_runner.py` (with `src/gpu_parquet.py` kept as
+a compatibility facade); the main workspace no longer overlays that runner or
+its tensor decoding onto Ray. Prepare generic upstream Ray changes in a separate
+Ray worktree so application benchmarks and upstream PR scope remain independent.
+
+Runtime tokenization code is grouped under `tfm_repo/src/tokenization/`:
+configuration/artifact contracts, the legacy Ray Data path, the direct GPU
+actor, tensor interoperability, and provenance are separate modules. Scientific
+A/B tools live under `tfm_repo/validation/tokenization/` behind the single
+`scripts/validate_tokenization.py` entry point. Machine-specific throughput
+settings live under `tfm_repo/benchmarks/tokenization/`, not in the production
+defaults.
 
 If you edit Ray Python code under `ray/python/ray`, rerun the notebooks with the `TFM Ray Dev (.venv)` kernel and the changes should be picked up immediately. If you edit Ray's compiled C++ core, rebuild/install a matching Ray wheel before expecting notebook runs to use those compiled changes.

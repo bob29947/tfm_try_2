@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "description": "Audited four-V100 v3 normal-RAID data-path benchmark",
+  "arguments": {
+    "actors": 4,
+    "num_cpus_per_actor": 16,
+    "num_gpus_per_actor": 1.0,
+    "local_num_cpus": 64,
+    "local_num_gpus": 4,
+    "row_groups_per_batch": 64,
+    "write_threads_per_actor": 12,
+    "output_shard_size_mb": 128,
+    "output_dtype": "uint16",
+    "output_format": "binary-tensor",
+    "use_dictionary": false,
+    "compression": "none",
+    "compression_level": 1,
+    "validate_order": false,
+    "gpu_runtime_env": "auto",
+    "no_prewarm_actors": false
+  }
+}

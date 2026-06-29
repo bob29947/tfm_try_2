@@ -20,7 +20,7 @@ SPLITS = ("train", "val", "test")
 LABEL_COLUMN = "Is Fraud?"
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("split_dir", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -30,7 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--batch-size", type=int, default=262_144)
     parser.add_argument("--overwrite", action="store_true")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def parquet_files(path: Path) -> list[Path]:
@@ -157,8 +157,8 @@ def write_sample_split(
     }
 
 
-def main() -> None:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
     split_dir = args.split_dir.expanduser().resolve()
     output_dir = args.output_dir.expanduser().resolve()
     if (

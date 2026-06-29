@@ -17,11 +17,11 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 
-TFM_ROOT = Path(__file__).resolve().parents[1]
+TFM_ROOT = Path(__file__).resolve().parents[2]
 SPLITS = ("train", "val", "test")
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("token_dir", type=Path)
     parser.add_argument("--checkpoint", action="append", required=True, metavar="ARM=PATH")
@@ -34,7 +34,7 @@ def parse_args() -> argparse.Namespace:
         "--ray-temp-dir", type=Path, default=Path("/dev/shm/tfm-downstream-embed")
     )
     parser.add_argument("--overwrite", action="store_true")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def parse_checkpoints(values: list[str]) -> dict[str, Path]:
@@ -122,8 +122,8 @@ def verify_paired_outputs(output_dir: Path) -> dict:
     return summary
 
 
-def main() -> None:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
     token_dir = args.token_dir.expanduser().resolve()
     output_dir = args.output_dir.expanduser().resolve()
     checkpoints = parse_checkpoints(args.checkpoint)

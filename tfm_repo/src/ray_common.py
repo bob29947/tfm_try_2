@@ -1,6 +1,18 @@
 import os
 from pathlib import Path
 
+from .tokenization.contract import (
+    BOS_TOKEN_ID,
+    EOS_TOKEN_ID,
+    MERCHANT_HASH_MODE,
+    MERCHANT_HASH_SIZE,
+    PAD_TOKEN_ID,
+    SEQ_CHUNK_SIZE,
+    SEQ_LENGTH,
+    SEP_TOKEN_ID,
+    UNK_TOKEN_ID,
+)
+
 # --------------------------------------------------------------------------- #
 # Shared, cross-node storage (NFS on Anyscale). Falls back to a local dir when
 # running off-Anyscale so the code is still importable anywhere.
@@ -77,20 +89,8 @@ TRAIN_JOB_ENV = {
     "env_vars": {"PIP_EXTRA_INDEX_URL": "https://pypi.nvidia.com"},
 }
 
-# Model / tokenizer constants shared across notebooks (match the original blueprint).
-MERCHANT_HASH_SIZE = 2000
-MERCHANT_HASH_MODE = "integer_mod"
-# Match the original blueprint exactly: 315 transactions packed into a
-# 4096-token causal-LM sequence (~13 tok/txn incl. separators). Same ~64K train
-# sequences and same model context window as the original NB02/03.
-SEQ_LENGTH = 4096             # tokens per training sequence (NB02 -> NB03)
-SEQ_CHUNK_SIZE = 315          # transactions per sequence (~13 tok/txn fills 4096)
+# Non-tokenization model constants shared across notebooks.
 EMB_MAX_LENGTH = 128          # per-transaction encode length for embeddings (NB04)
-PAD_TOKEN_ID = 0
-BOS_TOKEN_ID = 1
-EOS_TOKEN_ID = 2
-SEP_TOKEN_ID = 3
-UNK_TOKEN_ID = 4
 
 # Llama decoder config (the ~29M-param foundation model from the original NB03).
 MODEL_CONFIG = dict(

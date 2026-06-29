@@ -71,7 +71,7 @@ XGB_PARAMS = {
 }
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("raw_sample_dir", type=Path)
     parser.add_argument("embedding_dir", type=Path)
@@ -89,7 +89,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ray-temp-dir", type=Path, default=Path("/dev/shm/tfm-downstream-xgb")
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def parquet_files(path: Path) -> list[Path]:
@@ -230,8 +230,8 @@ def paired_user_bootstrap(
     }
 
 
-def main() -> None:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
     raw_root = args.raw_sample_dir.expanduser().resolve()
     embedding_root = args.embedding_dir.expanduser().resolve()
     args.output = args.output.expanduser().resolve()

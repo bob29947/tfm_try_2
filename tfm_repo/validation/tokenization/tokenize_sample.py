@@ -12,12 +12,12 @@ import sys
 from pathlib import Path
 
 
-TFM_ROOT = Path(__file__).resolve().parents[1]
+TFM_ROOT = Path(__file__).resolve().parents[2]
 SPLITS = ("train", "val", "test")
 MODES = ("string_hash", "integer_mod")
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("sample_dir", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -29,7 +29,7 @@ def parse_args() -> argparse.Namespace:
         "--ray-temp-dir", type=Path, default=Path("/dev/shm/tfm-downstream-tokenize")
     )
     parser.add_argument("--overwrite", action="store_true")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def count_parquet_rows(path: Path) -> int:
@@ -54,8 +54,8 @@ def parquet_manifest(path: Path) -> list[dict]:
     ]
 
 
-def main() -> None:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
     sample_dir = args.sample_dir.expanduser().resolve()
     output_dir = args.output_dir.expanduser().resolve()
     if (

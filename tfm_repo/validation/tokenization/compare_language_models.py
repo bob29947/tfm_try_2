@@ -24,10 +24,10 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 
-TFM_ROOT = Path(__file__).resolve().parents[1]
+TFM_ROOT = Path(__file__).resolve().parents[2]
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--corpus",
@@ -73,7 +73,7 @@ def parse_args() -> argparse.Namespace:
         help="Save each trained Hugging Face checkpoint for embedding validation.",
     )
     parser.add_argument("--ray-temp-dir", type=Path, default=Path("/dev/shm/tfm-downstream-ray"))
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def parse_corpora(values: list[str]) -> dict[str, Path]:
@@ -379,6 +379,7 @@ def code_provenance() -> dict:
         Path(__file__).resolve(),
         TFM_ROOT / "scripts" / "tokenize_splits.py",
         TFM_ROOT / "src" / "ray_tokenize.py",
+        *sorted((TFM_ROOT / "src" / "tokenization").glob("*.py")),
         TFM_ROOT / "src" / "tokenizer" / "financial_pipeline.py",
     ]
     hashes = {
@@ -632,8 +633,8 @@ def train_loop(config: dict) -> None:
         ray.train.report({"label": config["label"], "steps": config["steps"]})
 
 
-def main() -> None:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
     corpora = parse_corpora(args.corpus)
     hash_modes = parse_hash_modes(args.corpus_hash_mode, set(corpora))
     if args.merchant_hash_size < 1:

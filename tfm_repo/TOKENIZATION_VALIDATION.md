@@ -5,11 +5,31 @@ This note records the local V100 validation for branch
 remain under the ignored `data/` directory; source temporal splits were read
 only and were not modified.
 
+## Validation commands
+
+The validation implementations live under `validation/tokenization` and share
+one command-line entry point. Run it from the `tfm_repo` directory:
+
+```bash
+python -m validation.tokenization --help
+python -m validation.tokenization prepare-sample --help
+python -m validation.tokenization tokenize-sample --help
+python -m validation.tokenization compare-language-models --help
+python -m validation.tokenization extract-embeddings --help
+python -m validation.tokenization evaluate-fraud --help
+```
+
+The same subcommands are also available through the single stable script entry
+point `scripts/validate_tokenization.py`. The former five one-purpose scripts
+were internal experiment scaffolding and have been replaced by this package.
+
 ## V3 performance and output identity
 
 The final normal-RAID run used Ray with four one-GPU actors, 16 CPUs per actor,
 64 row groups per actor batch, 12 writer threads, 128 MiB output shards,
 fixed-size-binary `uint16` tensors, no compression, and no dictionary encoding.
+Those settings are now recorded as the explicit `v3-4x-v100` profile under
+`benchmarks/tokenization/profiles/`; normal deployment defaults remain two-GPU.
 
 - Original normal-RAID time: **7.07 s**
 - Previous optimized normal-RAID time: **4.54 s**
@@ -24,10 +44,11 @@ tokenization, sort, sequence construction, host transfer, and normal-RAID
 write remains in the timed path.
 
 The key-range planner and long-lived actor runner are application code in
-`src/gpu_parquet.py`. Ray supplies scheduling and GPU isolation, while the TFM
-pipeline owns its shared-filesystem, integral-key filtering, output commit, and
-RMM policies. Fixed-size-binary outputs are read through Ray's existing
-`tensor_column_schema` option rather than a custom Parquet datasource hook.
+`src/tokenization/parquet_runner.py`. Ray supplies scheduling and GPU isolation,
+while the TFM pipeline owns its shared-filesystem, integral-key filtering,
+output commit, and RMM policies. Fixed-size-binary outputs are read through
+Ray's existing `tensor_column_schema` option rather than a custom Parquet
+datasource hook.
 
 The 3.03 s median is from two final-code runs using the same prewarmed,
 page-cached, buffered data-path stopwatch used for the 7.07 s baseline. It
@@ -42,6 +63,12 @@ tensor schema option, a fresh normal-RAID audit measured **3.02 s** for the
 same data path, 22.71 s for provenance, and 33.92 s end to end. The source
 manifest, sequence counts, and all 56 output files (paths, rows, bytes, and
 SHA-256) remained identical.
+
+After reorganizing runtime and validation code into focused packages, the
+named `v3-4x-v100` profile completed a fresh normal-RAID run in **3.06 s** for
+the data path, 22.73 s for provenance, and 34.06 s end to end. Its normalized
+configuration, source manifest, runtime record, sequence counts, and all 56
+physical output files remained exactly identical to the prior audited run.
 
 Logical tensor bytes match the previously verified fast v3 corpus for every
 sequence:

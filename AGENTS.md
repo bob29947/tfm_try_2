@@ -11,8 +11,9 @@
   sandbox so Ray can see the GPUs, and use `--local-num-cpus 64
   --local-num-gpus 4` for the v3 target run.
 - Best known v3 GPU-parquet benchmark on this host uses 4 actors at 1 GPU
-  each, 16 CPUs each, 64 row groups per actor batch, fixed-size binary tensor
-  output, `uint16` token IDs, no parquet compression, and no dictionary
-  encoding. With actor prewarm and output cleanup excluded from the data
-  stopwatch, the measured v3 wall time was 6.49s for train/val/test when
-  writing output to `/dev/shm`; normal RAID output measured about 7.07s.
+  each, 16 CPUs each, 64 row groups per actor batch, 12 parquet writer threads
+  per actor, 128 MiB output shards, fixed-size binary tensor output, `uint16`
+  token IDs, no parquet compression, and no dictionary encoding. With actor
+  and CUDA-kernel prewarm plus output cleanup excluded from the data stopwatch,
+  the best measured v3 wall time was 4.56s for train/val/test on normal RAID
+  output; repeated runs with the same defaults measured 4.56-5.00s.

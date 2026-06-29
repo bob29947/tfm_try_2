@@ -17,6 +17,8 @@ from pathlib import Path
 
 TFM_ROOT = Path(__file__).resolve().parents[1]
 SPLITS = ("train", "val", "test")
+FAST_OUTPUT_IN_PROGRESS = "_IN_PROGRESS"
+FAST_OUTPUT_SUCCESS = "_SUCCESS"
 
 
 def parse_args() -> argparse.Namespace:
@@ -84,6 +86,24 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=64,
         help="gpu-parquet engine only: parquet row groups each GPU actor reads per batch.",
+    )
+    parser.add_argument(
+        "--write-threads-per-actor",
+        type=int,
+        default=12,
+        help=(
+            "gpu-parquet engine only: concurrent parquet shard writers per actor. "
+            "Large outputs are striped across these writers."
+        ),
+    )
+    parser.add_argument(
+        "--output-shard-size-mb",
+        type=int,
+        default=128,
+        help=(
+            "gpu-parquet engine only: target maximum uncompressed bytes per "
+            "striped output shard, in MiB."
+        ),
     )
     parser.add_argument(
         "--output-dtype",
@@ -172,6 +192,15 @@ def validate_args(args: argparse.Namespace) -> tuple[Path, Path]:
         raise ValueError("--num-cpus-per-actor must be at least 1")
     if args.row_groups_per_batch < 1:
         raise ValueError("--row-groups-per-batch must be at least 1")
+    if args.engine == "gpu-parquet":
+        if args.write_threads_per_actor < 1:
+            raise ValueError("--write-threads-per-actor must be at least 1")
+        if args.write_threads_per_actor > args.num_cpus_per_actor:
+            raise ValueError(
+                "--write-threads-per-actor cannot exceed --num-cpus-per-actor"
+            )
+        if args.output_shard_size_mb < 1:
+            raise ValueError("--output-shard-size-mb must be at least 1")
     output_dir = (
         args.output_dir.expanduser().resolve()
         if args.output_dir
@@ -276,6 +305,17 @@ def prepare_fast_outputs(
     for split in SPLITS:
         out = output_dir / split
         if nonempty_dir(out) and not args.overwrite:
+            in_progress = out / FAST_OUTPUT_IN_PROGRESS
+            success = out / FAST_OUTPUT_SUCCESS
+            if in_progress.exists() and not success.exists():
+                raise RuntimeError(
+                    f"Incomplete tokenized output found at {out}; "
+                    "pass --overwrite to replace it."
+                )
+            if not parquet_files(out):
+                raise RuntimeError(
+                    f"Tokenized output contains no parquet files: {out}"
+                )
             n = parquet_row_count(out)
             print(f"[{split:5s}] tokenized exists: {n:,} sequences at {out}")
             seq_counts[split] = n
@@ -283,9 +323,17 @@ def prepare_fast_outputs(
         if out.exists() and args.overwrite:
             shutil.rmtree(out)
         out.mkdir(parents=True, exist_ok=True)
+        (out / FAST_OUTPUT_IN_PROGRESS).touch()
         seq_counts[split] = 0
         pending.append(split)
     return seq_counts, pending
+
+
+def mark_fast_outputs_complete(output_dir: Path, pending: list[str]) -> None:
+    for split in pending:
+        out = output_dir / split
+        (out / FAST_OUTPUT_SUCCESS).touch()
+        (out / FAST_OUTPUT_IN_PROGRESS).unlink(missing_ok=True)
 
 
 def select_gpu_runtime_env(C, args: argparse.Namespace):
@@ -331,6 +379,8 @@ def tokenize_gpu_parquet(
         "use_dictionary": args.use_dictionary,
         "row_groups_per_batch": args.row_groups_per_batch,
         "arrow_cpu_threads": args.num_cpus_per_actor,
+        "write_threads": args.write_threads_per_actor,
+        "output_shard_size_bytes": args.output_shard_size_mb * 1024 * 1024,
         "validate_order": args.validate_order,
     }
     actors = None
@@ -384,6 +434,8 @@ def tokenize_gpu_parquet(
         f"{args.num_cpus_per_actor} CPU/actor, users {min_user:,}-{max_user:,}, "
         f"{nonempty_partitions} split partitions, "
         f"{args.row_groups_per_batch} row groups/batch, "
+        f"{args.write_threads_per_actor} write threads/actor, "
+        f"{args.output_shard_size_mb} MiB output shards, "
         f"output {args.output_format}/{args.output_dtype}, "
         f"compression {args.compression}, "
         f"dictionary {'on' if args.use_dictionary else 'off'}, "
@@ -400,6 +452,7 @@ def tokenize_gpu_parquet(
         runtime_env=runtime_env,
         actors=actors,
     )
+    mark_fast_outputs_complete(output_dir, pending)
     data_elapsed_s = time.time() - data_started
 
     for actor_stats in actor_results:
@@ -412,14 +465,20 @@ def tokenize_gpu_parquet(
             sort_s = float(stat.get("sort_s", 0.0))
             sequence_s = float(stat.get("sequence_s", 0.0))
             write_s = float(stat.get("write_s", 0.0))
+            output_files = int(stat.get("output_files", 1))
+            output_location = (
+                f"{output_files} files under {output_dir / split}"
+                if output_files > 1
+                else stat["output_path"]
+            )
             print(
-                f"[{split:5s}] shard written: "
+                f"[{split:5s}] output written: "
                 f"{int(stat.get('rows', 0)):,} rows -> "
                 f"{int(stat['count']):,} sequences in {elapsed_s:.2f}s "
                 f"(read {read_s:.2f}s, tokenize {tokenize_s:.2f}s, "
                 f"sort {sort_s:.2f}s, sequence {sequence_s:.2f}s, "
                 f"write {write_s:.2f}s) "
-                f"at {stat['output_path']}"
+                f"at {output_location}"
             )
 
     for split in pending:

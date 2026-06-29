@@ -143,6 +143,8 @@ class FastParquetSplitTokenizer:
         use_dictionary: bool = False,
         row_groups_per_batch: int = 4,
         arrow_cpu_threads: int | None = None,
+        write_threads: int = 1,
+        output_shard_size_bytes: int = 256 * 1024 * 1024,
         validate_order: bool = False,
     ):
         import cudf  # lazy: worker-only
@@ -177,7 +179,51 @@ class FastParquetSplitTokenizer:
         self.compression_level = compression_level
         self.use_dictionary = bool(use_dictionary)
         self.row_groups_per_batch = max(1, int(row_groups_per_batch))
+        self.write_threads = max(1, int(write_threads))
+        self.output_shard_size_bytes = max(1, int(output_shard_size_bytes))
         self.validate_order = bool(validate_order)
+
+        output_cuda_type = {
+            "uint16": "unsigned short",
+            "int32": "int",
+            "int64": "long long",
+        }[self.output_np_dtype.name]
+        self._sequence_scatter_kernel = cp.RawKernel(
+            rf"""
+            extern "C" __global__
+            void scatter_sequences(
+                const long long* keys,
+                const long long* seq_idx,
+                const long long* txn_pos,
+                const {output_cuda_type}* token_ids,
+                {output_cuda_type}* out,
+                const long long n,
+                const int n_fields,
+                const int seq_length,
+                const int chunk_size,
+                const {output_cuda_type} sep_token,
+                const {output_cuda_type} eos_token)
+            {{
+                const long long row =
+                    (long long)blockDim.x * blockIdx.x + threadIdx.x;
+                if (row >= n) return;
+
+                const long long txn = txn_pos[row];
+                const long long dst = seq_idx[row] * seq_length
+                    + 1 + txn * (n_fields + 1);
+                const long long src = row * n_fields;
+                #pragma unroll
+                for (int field = 0; field < {self.n_fields}; ++field) {{
+                    out[dst + field] = token_ids[src + field];
+                }}
+                const bool last = txn == chunk_size - 1
+                    || row + 1 == n || keys[row + 1] != keys[row];
+                out[dst + n_fields] = last ? eos_token : sep_token;
+            }}
+            """,
+            "scatter_sequences",
+        )
+        self._sequence_scatter_kernel.compile()
 
         self.industry_ranges = list(INDUSTRY_RANGES)
         self.chip_mapping = dict(CHIP_MAPPING)
@@ -191,6 +237,17 @@ class FastParquetSplitTokenizer:
         mcc_labels.append("-1")
         self.mcc_idx = {int(label): idx for idx, label in enumerate(dict.fromkeys(mcc_labels))}
         self.mcc_default_idx = self.mcc_idx[-1]
+
+        cat_lookup = np.full(10_000, self.cat_default_idx, dtype=np.int32)
+        for lo, hi, label in self.industry_ranges:
+            cat_lookup[max(0, lo) : min(10_000, hi + 1)] = self.cat_idx[label]
+        self.cat_lookup = cp.asarray(cat_lookup)
+
+        mcc_lookup = np.full(10_000, self.mcc_default_idx, dtype=np.int32)
+        for mcc, idx in self.mcc_idx.items():
+            if 0 <= mcc < len(mcc_lookup):
+                mcc_lookup[mcc] = idx
+        self.mcc_lookup = cp.asarray(mcc_lookup)
 
         chip_labels = sorted(set(CHIP_MAPPING.values()))
         chip_labels.append("UNK")
@@ -238,7 +295,7 @@ class FastParquetSplitTokenizer:
         self._prev_key = None
 
     def tokenize(self, work_items: list[dict]) -> list[dict]:
-        if len(work_items) > 1 and not self.validate_order:
+        if work_items and not self.validate_order:
             return self._tokenize_combined_splits(work_items)
 
         stats = []
@@ -330,12 +387,11 @@ class FastParquetSplitTokenizer:
         }
 
     def _tokenize_combined_splits(self, work_items: list[dict]) -> list[dict]:
-        split_ids = {work["split"]: idx for idx, work in enumerate(work_items)}
-        split_names = {idx: split for split, idx in split_ids.items()}
         output_paths = {work["split"]: work["output_path"] for work in work_items}
         row_counts = {work["split"]: 0 for work in work_items}
         counts = {work["split"]: 0 for work in work_items}
         write_s = {work["split"]: 0.0 for work in work_items}
+        output_files = {work["split"]: [] for work in work_items}
         read_s = 0.0
         tokenize_s = 0.0
         sort_s = 0.0
@@ -346,7 +402,6 @@ class FastParquetSplitTokenizer:
         try:
             for work in work_items:
                 split = work["split"]
-                split_id = split_ids[split]
                 for fragment in work["fragments"]:
                     row_groups = list(fragment["row_groups"])
                     for start in range(0, len(row_groups), self.row_groups_per_batch):
@@ -362,7 +417,6 @@ class FastParquetSplitTokenizer:
                         if len(gdf) == 0:
                             continue
                         row_counts[split] += len(gdf)
-                        gdf["__split_id"] = split_id
                         frames.append(gdf)
 
             if frames:
@@ -370,60 +424,74 @@ class FastParquetSplitTokenizer:
                 frames.clear()
 
                 op_started = time.perf_counter()
-                split_cp = gdf["__split_id"].astype("int32").to_cupy()
                 keys, txn_order, token_ids = self._tokenize_frame(gdf)
                 tokenize_s += time.perf_counter() - op_started
                 del gdf
 
-                op_started = time.perf_counter()
-                order = self.cp.lexsort(self.cp.stack([txn_order, keys, split_cp]))
-                split_cp = split_cp[order]
-                keys = keys[order]
-                token_ids = token_ids[order]
-                sort_s += time.perf_counter() - op_started
-
-                split_row_counts = self.cp.bincount(
-                    split_cp, minlength=len(work_items)
-                ).get()
-                del split_cp, txn_order, order
                 row_offset = 0
-                split_outputs = {}
-                for split_id, split in split_names.items():
-                    split_rows = int(split_row_counts[split_id])
-                    if split_rows == 0:
-                        continue
-                    row_end = row_offset + split_rows
+                from concurrent.futures import ThreadPoolExecutor
+
+                write_started = {}
+                futures = []
+
+                def write_shard(split: str, path: str, split_seqs: np.ndarray):
                     op_started = time.perf_counter()
-                    split_seqs = self._build_sequences_gpu(
-                        keys[row_offset:row_end],
-                        token_ids[row_offset:row_end],
-                    )
-                    sequence_s += time.perf_counter() - op_started
-                    row_offset = row_end
-                    if len(split_seqs) == 0:
-                        continue
-                    counts[split] += len(split_seqs)
-                    split_outputs[split] = split_seqs
-                del keys, token_ids, split_row_counts
+                    self._write_sequences(None, path, split_seqs)
+                    return split, time.perf_counter() - op_started, time.perf_counter()
 
-                if split_outputs:
-                    from concurrent.futures import ThreadPoolExecutor
+                with ThreadPoolExecutor(max_workers=self.write_threads) as executor:
+                    for work in work_items:
+                        split = work["split"]
+                        split_rows = row_counts[split]
+                        if split_rows == 0:
+                            continue
+                        row_end = row_offset + split_rows
+                        split_keys = keys[row_offset:row_end]
+                        split_order = txn_order[row_offset:row_end]
+                        split_tokens = token_ids[row_offset:row_end]
+                        row_offset = row_end
 
-                    def write_split(split: str, split_seqs: np.ndarray):
                         op_started = time.perf_counter()
-                        self._write_sequences(None, output_paths[split], split_seqs)
-                        return split, time.perf_counter() - op_started
+                        ordered = self._is_ordered(split_keys, split_order)
+                        if not ordered:
+                            if self._is_user_time_ordered(split_keys, split_order):
+                                # Stable key-only sorting preserves the existing
+                                # chronological order within each User/Card.
+                                order = self.cp.argsort(split_keys)
+                            else:
+                                order = self.cp.lexsort(
+                                    self.cp.stack([split_order, split_keys])
+                                )
+                            split_keys = split_keys[order]
+                            split_tokens = split_tokens[order]
+                        sort_s += time.perf_counter() - op_started
 
-                    max_workers = min(len(split_outputs), 3)
-                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                        futures = [
-                            executor.submit(write_split, split, split_seqs)
-                            for split, split_seqs in split_outputs.items()
-                        ]
-                        for future in futures:
-                            split, elapsed = future.result()
-                            write_s[split] += elapsed
-                    split_outputs.clear()
+                        op_started = time.perf_counter()
+                        split_seqs = self._build_sequences_gpu(
+                            split_keys,
+                            split_tokens,
+                        )
+                        sequence_s += time.perf_counter() - op_started
+                        if len(split_seqs) == 0:
+                            continue
+                        counts[split] += len(split_seqs)
+                        shards = self._sequence_output_shards(
+                            output_paths[split], split_seqs
+                        )
+                        output_files[split] = [path for path, _ in shards]
+                        write_started[split] = time.perf_counter()
+                        futures.extend(
+                            executor.submit(write_shard, split, path, shard)
+                            for path, shard in shards
+                        )
+
+                    del keys, txn_order, token_ids
+                    write_finished = {split: 0.0 for split in output_paths}
+                    for future in futures:
+                        split, _, finished = future.result()
+                        write_finished[split] = max(write_finished[split], finished)
+                    for split, started_at in write_started.items():
+                        write_s[split] = write_finished[split] - started_at
         finally:
             frames.clear()
 
@@ -439,11 +507,60 @@ class FastParquetSplitTokenizer:
                 "sort_s": sort_s,
                 "sequence_s": sequence_s,
                 "write_s": write_s[work["split"]],
+                "output_files": len(output_files[work["split"]]),
                 "combined_splits": len(work_items),
-                "output_path": output_paths[work["split"]],
+                "output_path": (
+                    output_files[work["split"]][0]
+                    if output_files[work["split"]]
+                    else output_paths[work["split"]]
+                ),
             }
             for work in work_items
         ]
+
+    def _is_ordered(self, keys, txn_order) -> bool:
+        if len(keys) < 2:
+            return True
+        out_of_order = (keys[1:] < keys[:-1]) | (
+            (keys[1:] == keys[:-1]) & (txn_order[1:] < txn_order[:-1])
+        )
+        return not bool(self.cp.any(out_of_order).get())
+
+    def _is_user_time_ordered(self, keys, txn_order) -> bool:
+        if len(keys) < 2:
+            return True
+        users = keys // 100
+        out_of_order = (users[1:] < users[:-1]) | (
+            (users[1:] == users[:-1]) & (txn_order[1:] < txn_order[:-1])
+        )
+        return not bool(self.cp.any(out_of_order).get())
+
+    def _sequence_output_shards(
+        self,
+        output_path: str,
+        seqs: np.ndarray,
+    ) -> list[tuple[str, np.ndarray]]:
+        shard_count = min(
+            len(seqs),
+            max(
+                1,
+                (seqs.nbytes + self.output_shard_size_bytes - 1)
+                // self.output_shard_size_bytes,
+            ),
+        )
+        if shard_count == 1:
+            return [(output_path, seqs)]
+
+        path = output_path
+        stem, suffix = path.rsplit(".", 1)
+        shard_id_width = max(2, len(str(shard_count - 1)))
+        shards = []
+        for shard_id in range(shard_count):
+            start = shard_id * len(seqs) // shard_count
+            end = (shard_id + 1) * len(seqs) // shard_count
+            shard_path = f"{stem}-{shard_id:0{shard_id_width}d}.{suffix}"
+            shards.append((shard_path, seqs[start:end]))
+        return shards
 
     def _read_row_groups(self, path: str, row_groups: list[int]):
         cudf = self.cudf
@@ -494,15 +611,21 @@ class FastParquetSplitTokenizer:
 
         mcc = gdf["mcc"].fillna(-1).astype("int64")
         mcc_cp = mcc.to_cupy()
-
-        cat_idx = cp.full(n, self.cat_default_idx, dtype=cp.int32)
-        for lo, hi, label in self.industry_ranges:
-            idx = self.cat_idx[label]
-            cat_idx = cp.where((mcc_cp >= lo) & (mcc_cp <= hi), idx, cat_idx)
+        valid_mcc = (mcc_cp >= 0) & (mcc_cp < len(self.mcc_lookup))
+        safe_mcc = cp.clip(mcc_cp, 0, len(self.mcc_lookup) - 1)
+        cat_idx = cp.where(
+            valid_mcc,
+            self.cat_lookup[safe_mcc],
+            self.cat_default_idx,
+        )
         token_ids[:, 2] = self.offset_cat + cat_idx
 
-        mcc_idx = mcc.map(self.mcc_idx).fillna(self.mcc_default_idx).astype("int32")
-        token_ids[:, 3] = self.offset_mcc + mcc_idx.to_cupy()
+        mcc_idx = cp.where(
+            valid_mcc,
+            self.mcc_lookup[safe_mcc],
+            self.mcc_default_idx,
+        )
+        token_ids[:, 3] = self.offset_mcc + mcc_idx
 
         time_col = gdf["time"].fillna("00:00").astype(str)
         hour = time_col.str.slice(0, 2).astype("int32").clip(0, 23)
@@ -603,23 +726,46 @@ class FastParquetSplitTokenizer:
         row_pos = cp.arange(n, dtype=cp.int64) - group_starts[group_ids]
         seq_idx = chunk_offsets[group_ids] + row_pos // self.chunk_size
         txn_pos = row_pos % self.chunk_size
-        base_pos = 1 + txn_pos * (self.n_fields + 1)
-
-        field_offsets = cp.arange(self.n_fields, dtype=cp.int64)
-        flat_pos = seq_idx[:, None] * self.seq_length + base_pos[:, None] + field_offsets[None, :]
-        out.reshape(-1)[flat_pos.reshape(-1)] = token_ids.reshape(-1)
-
-        sep_pos = base_pos + self.n_fields
-        out.reshape(-1)[seq_idx * self.seq_length + sep_pos] = C.SEP_TOKEN_ID
-        last_in_sequence = (txn_pos == self.chunk_size - 1) | cp.concatenate([
-            keys[1:] != keys[:-1],
-            cp.asarray([True], dtype=cp.bool_),
-        ])
-        eos_pos = (
-            seq_idx[last_in_sequence] * self.seq_length
-            + sep_pos[last_in_sequence]
-        )
-        out.reshape(-1)[eos_pos] = C.EOS_TOKEN_ID
+        if self.seq_length - 1 == self.chunk_size * (self.n_fields + 1):
+            threads = 256
+            blocks = (n + threads - 1) // threads
+            self._sequence_scatter_kernel(
+                (blocks,),
+                (threads,),
+                (
+                    keys,
+                    seq_idx,
+                    txn_pos,
+                    token_ids,
+                    out,
+                    np.int64(n),
+                    np.int32(self.n_fields),
+                    np.int32(self.seq_length),
+                    np.int32(self.chunk_size),
+                    self.output_np_dtype.type(C.SEP_TOKEN_ID),
+                    self.output_np_dtype.type(C.EOS_TOKEN_ID),
+                ),
+            )
+        else:
+            last_in_sequence = (txn_pos == self.chunk_size - 1) | cp.concatenate([
+                keys[1:] != keys[:-1],
+                cp.asarray([True], dtype=cp.bool_),
+            ])
+            base_pos = 1 + txn_pos * (self.n_fields + 1)
+            field_offsets = cp.arange(self.n_fields, dtype=cp.int64)
+            flat_pos = (
+                seq_idx[:, None] * self.seq_length
+                + base_pos[:, None]
+                + field_offsets[None, :]
+            )
+            out.reshape(-1)[flat_pos.reshape(-1)] = token_ids.reshape(-1)
+            sep_pos = base_pos + self.n_fields
+            out.reshape(-1)[seq_idx * self.seq_length + sep_pos] = C.SEP_TOKEN_ID
+            eos_pos = (
+                seq_idx[last_in_sequence] * self.seq_length
+                + sep_pos[last_in_sequence]
+            )
+            out.reshape(-1)[eos_pos] = C.EOS_TOKEN_ID
 
         return out.get()
 

@@ -1,0 +1,179 @@
+# Four-node S3-to-S3 TFM tokenization benchmark.
+# Launch from the workspace root with:
+#   .venv-aws/bin/ray up tfm_repo/benchmarks/tokenization/cluster/ray-tokenization-s3-4xl4.yaml -y
+
+cluster_name: ray-tfm-tokenize-s3-4xl4-bobbwang
+
+# One GPU head plus exactly three GPU workers.
+max_workers: 3
+upscaling_speed: 1.0
+idle_timeout_minutes: 15
+
+docker:
+    # The GPU Ray image is over 6 GiB and bundles ML frameworks this benchmark
+    # does not use.  The 0.85 GiB base image plus the pinned RAPIDS/CUDA wheels
+    # below is substantially faster to bootstrap; --gpus all supplies the L4
+    # driver libraries from the DLAMI host.
+    image: "rayproject/ray:2.55.1-py310"
+    container_name: "ray_container"
+    pull_before_run: true
+    run_options:
+        - --gpus all
+        - --shm-size=24gb
+        - --ulimit nofile=65536:65536
+        - --env AWS_DEFAULT_REGION=us-west-2
+        - --env PYTHONPATH=/home/ray/tfm
+        - -v /opt/dlami/nvme:/mnt/nvme
+
+provider:
+    type: aws
+    region: us-west-2
+    availability_zone: us-west-2d
+    cache_stopped_nodes: false
+
+auth:
+    ssh_user: ubuntu
+
+available_node_types:
+    ray.head.default:
+        resources: {}
+        node_config:
+            InstanceType: g6.4xlarge
+            ImageId: ami-0784c1a0dc19c0265
+            SubnetId: subnet-05c06444e737aa34a
+            IamInstanceProfile:
+                Arn: arn:aws:iam::503960270539:instance-profile/ray-autoscaler-v1
+            MetadataOptions:
+                HttpEndpoint: enabled
+                HttpPutResponseHopLimit: 2
+                HttpTokens: required
+            SecurityGroupIds:
+                - sg-0d659e94a2ffc5ded
+            BlockDeviceMappings:
+                - DeviceName: /dev/sda1
+                  Ebs:
+                      DeleteOnTermination: true
+                      Encrypted: true
+                      VolumeSize: 100
+                      VolumeType: gp3
+                      Iops: 3000
+                      Throughput: 125
+            TagSpecifications:
+                - ResourceType: instance
+                  Tags:
+                      - {Key: Owner, Value: bobbwang}
+                      - {Key: Project, Value: tfm_try_2}
+                      - {Key: Purpose, Value: tokenization-s3-benchmark}
+                      - {Key: Cluster, Value: ray-tfm-tokenize-s3-4xl4-bobbwang}
+                - ResourceType: volume
+                  Tags:
+                      - {Key: Owner, Value: bobbwang}
+                      - {Key: Project, Value: tfm_try_2}
+                      - {Key: Purpose, Value: tokenization-s3-benchmark}
+                      - {Key: Cluster, Value: ray-tfm-tokenize-s3-4xl4-bobbwang}
+    ray.worker.default:
+        min_workers: 3
+        max_workers: 3
+        resources: {}
+        node_config:
+            InstanceType: g6.4xlarge
+            ImageId: ami-0784c1a0dc19c0265
+            SubnetId: subnet-05c06444e737aa34a
+            IamInstanceProfile:
+                Arn: arn:aws:iam::503960270539:instance-profile/ray-autoscaler-v1
+            MetadataOptions:
+                HttpEndpoint: enabled
+                HttpPutResponseHopLimit: 2
+                HttpTokens: required
+            SecurityGroupIds:
+                - sg-0d659e94a2ffc5ded
+            BlockDeviceMappings:
+                - DeviceName: /dev/sda1
+                  Ebs:
+                      DeleteOnTermination: true
+                      Encrypted: true
+                      VolumeSize: 100
+                      VolumeType: gp3
+                      Iops: 3000
+                      Throughput: 125
+            TagSpecifications:
+                - ResourceType: instance
+                  Tags:
+                      - {Key: Owner, Value: bobbwang}
+                      - {Key: Project, Value: tfm_try_2}
+                      - {Key: Purpose, Value: tokenization-s3-benchmark}
+                      - {Key: Cluster, Value: ray-tfm-tokenize-s3-4xl4-bobbwang}
+                - ResourceType: volume
+                  Tags:
+                      - {Key: Owner, Value: bobbwang}
+                      - {Key: Project, Value: tfm_try_2}
+                      - {Key: Purpose, Value: tokenization-s3-benchmark}
+                      - {Key: Cluster, Value: ray-tfm-tokenize-s3-4xl4-bobbwang}
+
+head_node_type: ray.head.default
+
+# Mount only the code needed by this benchmark. Ray hashes file mounts before
+# rsync exclusions are applied, so mounting the 98 GiB repository root would
+# spend minutes reading local data even though those bytes are never uploaded.
+file_mounts:
+    "/home/ray/tfm": "./.artifacts/tfm-cloud-bundle"
+    "/home/ray/ray-wheel": "./.artifacts/ray-wheel-bundle"
+
+rsync_exclude:
+    - "**/.git"
+    - "**/.git/**"
+    - "**/__pycache__"
+    - "**/__pycache__/**"
+    - "**/*.pyc"
+    - "**/.pytest_cache"
+
+# The DLAMI normally mounts the 600 GiB instance SSD at /opt/dlami/nvme. The
+# fallback only considers an unmounted, non-root disk on these fresh instances.
+initialization_commands:
+    - test -x "$(command -v docker)"
+    - |
+       set -e
+       sudo mkdir -p /opt/dlami/nvme
+       if ! mountpoint -q /opt/dlami/nvme; then
+         ROOT_SRC=$(findmnt -no SOURCE / || true)
+         ROOT_DISK=$(lsblk -no PKNAME "$ROOT_SRC" 2>/dev/null | head -1 || true)
+         for DEV in $(lsblk -dpno NAME,TYPE | awk '$2=="disk"{print $1}'); do
+           BN=$(basename "$DEV")
+           [ "$BN" = "$ROOT_DISK" ] && continue
+           lsblk -no MOUNTPOINT "$DEV" | grep -q . && continue
+           sudo mkfs.ext4 -F -E nodiscard "$DEV"
+           sudo mount "$DEV" /opt/dlami/nvme
+           break
+         done
+       fi
+       sudo chmod 1777 /opt/dlami/nvme
+       mountpoint -q /opt/dlami/nvme
+       NVME_SRC=$(findmnt -no SOURCE /opt/dlami/nvme)
+       NVME_BYTES=$(sudo blockdev --getsize64 "$NVME_SRC")
+       test "$NVME_BYTES" -ge 500000000000
+       test -w /opt/dlami/nvme
+
+# Install one pinned, shared stack on every node. Benchmark jobs explicitly use
+# no pip runtime_env, so setup never contaminates warmup or pipeline timing.
+setup_commands:
+    - python -m pip install --upgrade "ray[default,data] @ file:///home/ray/ray-wheel/ray-3.0.0.dev0-cp310-cp310-manylinux2014_x86_64.whl"
+    # Keep boto3 and aiobotocore on the same botocore build.  Newer boto3
+    # releases are not resolver-compatible with s3fs 2026.6.0.  Replace the
+    # base-image SciPy alongside NumPy so cupyx.scipy never loads a NumPy-1.x
+    # compiled extension into this NumPy-2.x environment.
+    - python -m pip install --upgrade "numpy==2.2.6" "scipy==1.15.3" "pandas==2.3.3" "pyarrow==19.0.1" "fsspec==2026.6.0" "s3fs==2026.6.0" "boto3==1.42.90" "botocore==1.42.90" "aiobotocore==3.7.0" "nvidia-ml-py" "psutil"
+    - python -m pip install --upgrade --extra-index-url https://pypi.nvidia.com "cudf-cu12==25.10.0" "kvikio-cu12==25.10.0" "cupy-cuda12x[ctk]==14.1.1"
+    - python -c "import boto3,cudf,cupy,kvikio,numpy,pyarrow,ray,s3fs; import cupyx.scipy,scipy; from scipy import linalg; linalg.det(numpy.eye(2)); print(ray.__version__, cudf.__version__, numpy.__version__, scipy.__version__, pyarrow.__version__)"
+
+head_setup_commands: []
+worker_setup_commands: []
+
+head_start_ray_commands:
+    - ray stop
+    - mkdir -p /mnt/nvme/ray/spill
+    - ray start --head --port=6379 --object-manager-port=8076 --autoscaling-config=~/ray_bootstrap_config.yaml --dashboard-host=0.0.0.0 --temp-dir=/mnt/nvme/ray --object-spilling-directory=/mnt/nvme/ray/spill
+
+worker_start_ray_commands:
+    - ray stop
+    - mkdir -p /mnt/nvme/ray/spill
+    - ray start --address=$RAY_HEAD_IP:6379 --object-manager-port=8076 --temp-dir=/mnt/nvme/ray --object-spilling-directory=/mnt/nvme/ray/spill

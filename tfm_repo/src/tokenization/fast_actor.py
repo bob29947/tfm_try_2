@@ -7,11 +7,44 @@ lazily when the actor starts so the module remains importable on a CPU driver.
 
 from __future__ import annotations
 
+import gc
+import os
+import socket
 import time
+from urllib.parse import urlsplit
 
 import numpy as np
 
 from . import contract as C
+
+
+def _configure_kvikio_runtime(
+    defaults_module,
+    *,
+    num_threads: int,
+    task_size_bytes: int,
+) -> dict[str, int]:
+    """Set and verify the KvikIO process defaults used by cuDF remote reads."""
+    requested = {
+        "num_threads": int(num_threads),
+        "task_size_bytes": int(task_size_bytes),
+    }
+    defaults_module.set(
+        {
+            "num_threads": requested["num_threads"],
+            "task_size": requested["task_size_bytes"],
+        }
+    )
+    realized = {
+        "num_threads": int(defaults_module.get("num_threads")),
+        "task_size_bytes": int(defaults_module.get("task_size")),
+    }
+    if realized != requested:
+        raise RuntimeError(
+            "KvikIO runtime settings mismatch: "
+            f"requested={requested!r}, realized={realized!r}"
+        )
+    return realized
 
 
 class FastParquetSplitTokenizer:
@@ -49,12 +82,104 @@ class FastParquetSplitTokenizer:
         compression: str = "zstd",
         compression_level: int | None = 1,
         use_dictionary: bool = False,
-        row_groups_per_batch: int = 4,
+        row_groups_per_batch: int = 16,
         arrow_cpu_threads: int | None = None,
         write_threads: int = 1,
         output_shard_size_bytes: int = 256 * 1024 * 1024,
         validate_order: bool = False,
+        s3_mode: bool = False,
+        aws_region: str | None = None,
+        s3_connections: int = 8,
+        kvikio_task_size_bytes: int = 4 * 1024 * 1024,
+        overlap_split_writes: bool = False,
+        require_kvikio: bool = True,
     ):
+        self.s3_mode = bool(s3_mode)
+        self.s3_connections = max(1, int(s3_connections))
+        self.kvikio_task_size_bytes = int(kvikio_task_size_bytes)
+        if self.kvikio_task_size_bytes < 1:
+            raise ValueError("kvikio_task_size_bytes must be at least 1")
+        self.overlap_split_writes = bool(overlap_split_writes)
+        self.aws_region = aws_region
+        self.arrow_s3_fs = None
+        self.s3fs = None
+        self._s3_backend = "local"
+        self._kvikio_realized = None
+
+        if self.s3_mode:
+            # cuDF's KvikIO remote reader consumes AWS credentials from the
+            # environment.  Resolve the instance-role chain once per actor,
+            # before importing cuDF, and freeze it for this bounded benchmark.
+            # s3fs and Arrow clients are likewise actor-local and reused.
+            import botocore.session
+
+            session = botocore.session.get_session()
+            credentials = session.get_credentials()
+            if credentials is None:
+                raise RuntimeError(
+                    "No AWS credentials available for the fail-closed S3 GPU path"
+                )
+            frozen = credentials.get_frozen_credentials()
+            os.environ["AWS_ACCESS_KEY_ID"] = frozen.access_key
+            os.environ["AWS_SECRET_ACCESS_KEY"] = frozen.secret_key
+            if frozen.token:
+                os.environ["AWS_SESSION_TOKEN"] = frozen.token
+            else:
+                os.environ.pop("AWS_SESSION_TOKEN", None)
+
+            self.aws_region = (
+                self.aws_region
+                or os.environ.get("AWS_DEFAULT_REGION")
+                or os.environ.get("AWS_REGION")
+                or session.get_config_variable("region")
+                or "us-west-2"
+            )
+            os.environ["AWS_DEFAULT_REGION"] = self.aws_region
+            os.environ["AWS_REGION"] = self.aws_region
+            # KvikIO documents this as the remote reader's TCP concurrency
+            # control; set it before importing cuDF/KvikIO.
+            os.environ["KVIKIO_NTHREADS"] = str(self.s3_connections)
+            os.environ["KVIKIO_TASK_SIZE"] = str(self.kvikio_task_size_bytes)
+
+            import s3fs
+            import pyarrow.fs as pafs
+
+            self.s3fs = s3fs.S3FileSystem(
+                anon=False,
+                client_kwargs={"region_name": self.aws_region},
+                config_kwargs={"max_pool_connections": self.s3_connections},
+            )
+            self.arrow_s3_fs = pafs.S3FileSystem(
+                region=self.aws_region,
+                background_writes=True,
+            )
+
+            if require_kvikio:
+                try:
+                    import kvikio.defaults as kvikio_defaults
+                    from kvikio.remote_file import is_remote_file_available
+                except (ImportError, ModuleNotFoundError) as exc:
+                    raise RuntimeError(
+                        "KvikIO remote I/O is required for S3 tokenization"
+                    ) from exc
+                if not is_remote_file_available():
+                    raise RuntimeError(
+                        "KvikIO was built without remote I/O support; refusing "
+                        "to fall back to whole-object S3 prefetch"
+                    )
+
+                # Apply these settings through KvikIO's runtime API as well as
+                # its environment variables, then record the values actually
+                # realized by the actor.  This occurs during actor startup,
+                # before cuDF can issue a remote read.  A mismatch is fatal so
+                # a benchmark never silently measures a different thread pool
+                # or transfer granularity than its requested configuration.
+                self._kvikio_realized = _configure_kvikio_runtime(
+                    kvikio_defaults,
+                    num_threads=self.s3_connections,
+                    task_size_bytes=self.kvikio_task_size_bytes,
+                )
+
         # The fast path creates and releases several multi-GiB temporary arrays.
         # cudaMalloc/cudaFree serialization is otherwise a material part of the
         # data stopwatch, so give each long-lived, one-GPU actor its own RMM
@@ -63,6 +188,8 @@ class FastParquetSplitTokenizer:
         # keep 2 GiB outside the pool for CUDA libraries, and adapt down on
         # smaller or partially occupied GPUs.
         import rmm
+
+        self.rmm = rmm
 
         gib = 1 << 30
         free_bytes, _ = rmm.mr.available_device_memory()
@@ -89,6 +216,20 @@ class FastParquetSplitTokenizer:
         )
 
         cp.cuda.set_allocator(rmm_cupy_allocator)
+
+        if self.s3_mode:
+            try:
+                cudf.set_option("kvikio_remote_io", True)
+                kvikio_enabled = bool(cudf.get_option("kvikio_remote_io"))
+            except (KeyError, AttributeError, ValueError) as exc:
+                raise RuntimeError(
+                    "Installed cuDF does not expose the KvikIO remote I/O option"
+                ) from exc
+            if require_kvikio and not kvikio_enabled:
+                raise RuntimeError(
+                    "cuDF rejected KvikIO remote I/O; refusing S3 fallback"
+                )
+            self._s3_backend = "cudf-kvikio"
 
         if arrow_cpu_threads:
             pa.set_cpu_count(int(arrow_cpu_threads))
@@ -225,33 +366,86 @@ class FastParquetSplitTokenizer:
         self._carry_tokens = None
         self._prev_key = None
 
-    def tokenize(self, work_items: list[dict]) -> list[dict]:
-        if work_items and not self.validate_order:
-            return self._tokenize_combined_splits(work_items)
+    def ready(self) -> dict:
+        """Return the realized actor I/O backend after initialization."""
+        import ray
 
-        stats = []
-        for work in work_items:
-            stats.append(self._tokenize_one_split(work))
-        return stats
+        context = ray.get_runtime_context()
+        accelerator_ids = (
+            context.get_accelerator_ids()
+            if hasattr(context, "get_accelerator_ids")
+            else {"GPU": [str(value) for value in ray.get_gpu_ids()]}
+        )
+        return {
+            "ready": True,
+            "node_id": str(context.get_node_id()),
+            "hostname": socket.gethostname(),
+            "accelerator_ids": {
+                str(kind): [str(value) for value in values]
+                for kind, values in accelerator_ids.items()
+            },
+            "s3_mode": self.s3_mode,
+            "read_backend": self._s3_backend,
+            "write_backend": (
+                "pyarrow.fs.S3FileSystem" if self.s3_mode else "local-pyarrow"
+            ),
+            "aws_region": self.aws_region,
+            "s3_connections": self.s3_connections if self.s3_mode else None,
+            "kvikio_num_threads": (
+                self._kvikio_realized["num_threads"]
+                if self._kvikio_realized is not None
+                else None
+            ),
+            "kvikio_task_size_bytes": (
+                self._kvikio_realized["task_size_bytes"]
+                if self._kvikio_realized is not None
+                else None
+            ),
+            "row_groups_per_batch": self.row_groups_per_batch,
+            "overlap_split_writes": getattr(self, "overlap_split_writes", False),
+        }
+
+    def tokenize(self, work_items: list[dict]) -> list[dict]:
+        # A 24 GiB L4 cannot safely retain raw train/val/test frames together.
+        # GPU frames are always released split by split; the opt-in path only
+        # retains bounded host output while preparing the next split.
+        if getattr(self, "overlap_split_writes", False) and len(work_items) > 1:
+            return self._tokenize_with_overlapped_writes(work_items)
+        return [self._tokenize_one_split(work) for work in work_items]
 
     def __call__(self, work_items: list[dict]) -> list[dict]:
         return self.tokenize(work_items)
 
     def _tokenize_one_split(self, work: dict) -> dict:
+        stat, shards, started = self._prepare_one_split(work)
+        if shards:
+            op_started = time.perf_counter()
+            self._write_shards_sync(shards)
+            stat["write_s"] = time.perf_counter() - op_started
+            stat["write_wait_s"] = stat["write_s"]
+        stat["elapsed_s"] = time.perf_counter() - started
+        return stat
+
+    def _prepare_one_split(
+        self, work: dict
+    ) -> tuple[dict, list[tuple[str, np.ndarray]], float]:
+        """Read, tokenize, and build one split without starting its writes."""
         output_path = work["output_path"]
-        writer = None
         count = 0
         rows = 0
         read_s = 0.0
         tokenize_s = 0.0
         sort_s = 0.0
         sequence_s = 0.0
-        write_s = 0.0
         started = time.perf_counter()
         self._prev_key = None
         key_batches = []
         time_batches = []
         token_batches = []
+        output_paths = []
+        shards: list[tuple[str, np.ndarray]] = []
+        free_before, total_device_memory = self.rmm.mr.available_device_memory()
+        reserved_before = int(total_device_memory - free_before)
 
         try:
             for fragment in work["fragments"]:
@@ -262,9 +456,11 @@ class FastParquetSplitTokenizer:
                     gdf = self._read_row_groups(fragment["path"], batch_row_groups)
                     read_s += time.perf_counter() - op_started
                     if len(gdf) == 0:
+                        del gdf
                         continue
                     gdf = self._filter_user_range(gdf, work["user_min"], work["user_max"])
                     if len(gdf) == 0:
+                        del gdf
                         continue
                     rows += len(gdf)
 
@@ -282,40 +478,246 @@ class FastParquetSplitTokenizer:
                 keys = self.cp.concatenate(key_batches)
                 txn_order = self.cp.concatenate(time_batches)
                 token_ids = self.cp.concatenate(token_batches, axis=0)
-                order = self.cp.lexsort(self.cp.stack([txn_order, keys]))
-                keys = keys[order]
-                token_ids = token_ids[order]
+                # The concatenated arrays own their data.  Drop all per-read
+                # batches before allocating sort indices on a 24 GiB L4.
+                key_batches.clear()
+                time_batches.clear()
+                token_batches.clear()
+                # The temporal split is normally already ordered by
+                # User/Card/time.  Avoid materializing and applying a full
+                # permutation when that contract holds, but retain the exact
+                # legacy ordering for any input that does not.
+                order = None
+                if not self._is_ordered(keys, txn_order):
+                    if self._is_user_time_ordered(keys, txn_order):
+                        # Stable key-only sorting preserves chronological
+                        # order within each User/Card.
+                        order = self.cp.argsort(keys)
+                    else:
+                        order = self.cp.lexsort(
+                            self.cp.stack([txn_order, keys])
+                        )
+                    keys = keys[order]
+                    token_ids = token_ids[order]
                 sort_s += time.perf_counter() - op_started
 
                 op_started = time.perf_counter()
                 seqs = self._build_sequences_gpu(keys, token_ids)
                 sequence_s += time.perf_counter() - op_started
-                op_started = time.perf_counter()
-                writer = self._write_sequences(writer, output_path, seqs)
-                write_s += time.perf_counter() - op_started
                 count += len(seqs)
 
-                del keys, txn_order, token_ids, order, seqs
+                shards = self._sequence_output_shards(output_path, seqs)
+                output_paths = [path for path, _ in shards]
+                del keys, txn_order, token_ids, seqs
+                if order is not None:
+                    del order
         finally:
-            if writer is not None:
-                writer.close()
             self._prev_key = None
             key_batches.clear()
             time_batches.clear()
             token_batches.clear()
 
-        return {
+        compute_s = time.perf_counter() - started
+        free_after, total_device_memory_after = self.rmm.mr.available_device_memory()
+        reserved_after = int(total_device_memory_after - free_after)
+        stat = {
             "split": work["split"],
             "count": count,
             "rows": rows,
-            "elapsed_s": time.perf_counter() - started,
+            "elapsed_s": compute_s,
+            "compute_s": compute_s,
             "read_s": read_s,
             "tokenize_s": tokenize_s,
             "sort_s": sort_s,
             "sequence_s": sequence_s,
-            "write_s": write_s,
-            "output_path": output_path,
+            "write_s": 0.0,
+            "write_wait_s": 0.0,
+            "write_overlap_s": 0.0,
+            "output_files": len(output_paths),
+            "output_paths": output_paths,
+            "output_path": output_paths[0] if output_paths else output_path,
+            # The RMM pool retains acquired CUDA allocations until actor exit,
+            # so its post-compute driver reservation is a stable high-water
+            # signal for deciding whether a batching config is safe on L4.
+            "gpu_memory_reserved_before_bytes": reserved_before,
+            "peak_gpu_memory_bytes": max(reserved_before, reserved_after),
+            "gpu_total_memory_bytes": int(total_device_memory_after),
         }
+        return stat, shards, started
+
+    def _write_shards_sync(self, shards: list[tuple[str, np.ndarray]]) -> None:
+        """Write every shard and clean visible siblings if any writer fails."""
+        paths = [path for path, _ in shards]
+        try:
+            if len(shards) == 1:
+                path, shard = shards[0]
+                self._write_sequences(None, path, shard)
+                return
+
+            from concurrent.futures import ThreadPoolExecutor, wait
+
+            with ThreadPoolExecutor(max_workers=self.write_threads) as executor:
+                futures = [
+                    executor.submit(self._write_sequences, None, path, shard)
+                    for path, shard in shards
+                ]
+                # Settle all streams before surfacing a failure. This guarantees
+                # that cleanup never races an in-flight multipart close.
+                wait(futures)
+                for future in futures:
+                    future.result()
+        except BaseException:
+            self._cleanup_output_paths(paths)
+            raise
+
+    def _tokenize_with_overlapped_writes(
+        self, work_items: list[dict]
+    ) -> list[dict]:
+        """Overlap split N writes with split N+1 GPU work, one split at a time.
+
+        Exactly one split may have writes in flight. The next split can be
+        prepared concurrently, after which the prior writes are drained before
+        another set is submitted. Thus host memory retains at most the prior
+        and current split outputs, while GPU frames remain strictly split-local.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        stats: list[dict] = []
+        completed_paths: list[str] = []
+        pending: dict | None = None
+        prepared_shards: list[tuple[str, np.ndarray]] = []
+
+        with ThreadPoolExecutor(max_workers=self.write_threads) as executor:
+            try:
+                for work in work_items:
+                    stat, prepared_shards, started = self._prepare_one_split(work)
+
+                    # The previous split has been writing while this split used
+                    # the GPU. Drain it before submitting another split so the
+                    # actor never accumulates an unbounded host-side queue.
+                    if pending is not None:
+                        previous = pending
+                        pending = None
+                        self._finish_pending_writes(previous)
+                        completed_paths.extend(previous["paths"])
+                        stats.append(previous["stat"])
+
+                    if prepared_shards:
+                        pending = self._submit_split_writes(
+                            executor, stat, prepared_shards, started
+                        )
+                    else:
+                        stats.append(stat)
+                    prepared_shards = []
+
+                if pending is not None:
+                    previous = pending
+                    pending = None
+                    self._finish_pending_writes(previous)
+                    completed_paths.extend(previous["paths"])
+                    stats.append(previous["stat"])
+            except BaseException:
+                # If GPU preparation fails, settle the one allowed pending
+                # batch before deleting its visible objects. If a writer fails,
+                # _finish_pending_writes already settled and cleaned that batch.
+                if pending is not None:
+                    try:
+                        self._finish_pending_writes(pending)
+                    except BaseException:
+                        pass
+                    self._cleanup_output_paths(pending["paths"])
+                self._cleanup_output_paths(completed_paths)
+                prepared_shards.clear()
+                raise
+
+        return stats
+
+    def _submit_split_writes(
+        self,
+        executor,
+        stat: dict,
+        shards: list[tuple[str, np.ndarray]],
+        split_started: float,
+    ) -> dict:
+        from concurrent.futures import wait
+
+        submitted = time.perf_counter()
+        paths = [path for path, _ in shards]
+        futures = []
+        try:
+            for path, shard in shards:
+                futures.append(
+                    executor.submit(self._timed_write_sequence, path, shard)
+                )
+        except BaseException:
+            # Submission itself can fail after earlier futures have started.
+            # Settle those writers before deleting their keys.
+            wait(futures)
+            self._cleanup_output_paths(paths)
+            raise
+        return {
+            "stat": stat,
+            "paths": paths,
+            "futures": futures,
+            "split_started": split_started,
+            "submitted": submitted,
+        }
+
+    def _timed_write_sequence(self, path: str, shard: np.ndarray) -> dict:
+        started = time.perf_counter()
+        self._write_sequences(None, path, shard)
+        return {
+            "elapsed_s": time.perf_counter() - started,
+            "finished": time.perf_counter(),
+        }
+
+    def _finish_pending_writes(self, pending: dict) -> None:
+        from concurrent.futures import wait
+
+        wait_started = time.perf_counter()
+        wait(pending["futures"])
+        write_wait_s = time.perf_counter() - wait_started
+        results = []
+        first_error: BaseException | None = None
+        for future in pending["futures"]:
+            try:
+                results.append(future.result())
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            self._cleanup_output_paths(pending["paths"])
+            raise first_error
+
+        finished = max(
+            (result["finished"] for result in results),
+            default=pending["submitted"],
+        )
+        write_s = finished - pending["submitted"]
+        stat = pending["stat"]
+        stat["write_s"] = write_s
+        stat["write_wait_s"] = min(write_wait_s, write_s)
+        stat["write_overlap_s"] = max(0.0, write_s - stat["write_wait_s"])
+        stat["elapsed_s"] = finished - pending["split_started"]
+
+    def _cleanup_output_paths(self, output_paths: list[str]) -> None:
+        """Best-effort deletion after a split or actor-level failure."""
+        for output_path in dict.fromkeys(output_paths):
+            try:
+                if output_path.startswith("s3://"):
+                    if self.arrow_s3_fs is None:
+                        continue
+                    parsed = urlsplit(output_path)
+                    arrow_path = f"{parsed.netloc}/{parsed.path.lstrip('/')}"
+                    info = self.arrow_s3_fs.get_file_info(arrow_path)
+                    if info.type.name == "File":
+                        self.arrow_s3_fs.delete_file(arrow_path)
+                elif os.path.isfile(output_path):
+                    os.remove(output_path)
+            except Exception:
+                # The benchmark harness performs a prefix-level fallback
+                # cleanup, including multipart aborts, after actor failure.
+                pass
 
     def _tokenize_combined_splits(self, work_items: list[dict]) -> list[dict]:
         output_paths = {work["split"]: work["output_path"] for work in work_items}
@@ -495,6 +897,29 @@ class FastParquetSplitTokenizer:
 
     def _read_row_groups(self, path: str, row_groups: list[int]):
         cudf = self.cudf
+        if path.startswith("s3://"):
+            if not self.s3_mode or self._s3_backend != "cudf-kvikio":
+                raise RuntimeError(
+                    "S3 input requires the actor's fail-closed cuDF/KvikIO mode"
+                )
+            if not bool(cudf.get_option("kvikio_remote_io")):
+                raise RuntimeError(
+                    "cuDF KvikIO remote I/O was disabled after actor startup"
+                )
+            # Do not pass ``filesystem=self.s3fs`` here: that explicitly routes
+            # through fsspec and can prefetch a whole object into host memory.
+            # With the option above, cuDF builds a KvikIO remote datasource and
+            # issues byte-range reads only for the requested row groups/columns.
+            return cudf.read_parquet(
+                path,
+                engine="cudf",
+                columns=self.COLUMNS,
+                row_groups=row_groups,
+                dataset_kwargs={"partitioning": None},
+                use_pandas_metadata=False,
+                categorical_partitions=False,
+            )
+
         try:
             return cudf.read_parquet(path, columns=self.COLUMNS, row_groups=row_groups)
         except TypeError:
@@ -730,5 +1155,43 @@ class FastParquetSplitTokenizer:
         }
         if self.compression_level is not None:
             kwargs["compression_level"] = self.compression_level
-        self.pq.write_table(table, output_path, **kwargs)
+        if output_path.startswith("s3://"):
+            if not self.s3_mode or self.arrow_s3_fs is None:
+                raise RuntimeError(
+                    "S3 output requires an actor-local Arrow S3 filesystem"
+                )
+            parsed = urlsplit(output_path)
+            if not parsed.netloc or not parsed.path.lstrip("/"):
+                raise ValueError(f"Invalid S3 output URI: {output_path!r}")
+            arrow_path = f"{parsed.netloc}/{parsed.path.lstrip('/')}"
+            sink = self.arrow_s3_fs.open_output_stream(
+                arrow_path,
+                metadata={"Content-Type": "application/vnd.apache.parquet"},
+            )
+            try:
+                self.pq.write_table(table, sink, **kwargs)
+                # Arrow's S3 close completes and waits for the multipart upload.
+                sink.close()
+            except BaseException:
+                # C++ OutputStream::Abort is invoked by the unclosed S3 stream's
+                # destructor.  Newer PyArrow builds may expose it directly.
+                abort = getattr(sink, "abort", None)
+                if callable(abort):
+                    try:
+                        abort()
+                    except Exception:
+                        pass
+                sink = None
+                gc.collect()
+                # A failed close can very rarely leave a visible partial key;
+                # never let that object be mistaken for a completed shard.
+                try:
+                    info = self.arrow_s3_fs.get_file_info(arrow_path)
+                    if info.type.name == "File":
+                        self.arrow_s3_fs.delete_file(arrow_path)
+                except Exception:
+                    pass
+                raise
+        else:
+            self.pq.write_table(table, output_path, **kwargs)
         return None

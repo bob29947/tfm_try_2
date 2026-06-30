@@ -4,11 +4,13 @@
 
 # Local Python environments
 .venv/
+.venv-aws/
 venv/
 .conda/
 .env
 .env.*
 !.env.example
+/.artifacts/
 
 # Python and notebook cache
 __pycache__/
